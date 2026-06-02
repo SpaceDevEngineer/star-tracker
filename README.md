@@ -1,11 +1,12 @@
 # Star Tracker — Spacecraft Attitude Determination from Real Satellite Imagery
 
 **Sub-pixel "lost-in-space" attitude estimation on real NASA TESS imagery, built with deep
-learning + classical geometry.** Recovers a spacecraft's 3-axis orientation from a single
-PNG of the star field with no prior pose information.
+learning + classical geometry.** Given a single image plus the camera's pre-calibrated
+intrinsics (SIP polynomial + CRPIX + CD shear — factory-calibrated, attitude-independent),
+the pipeline recovers a spacecraft's 3-axis orientation with no prior pose information.
 
 ![Pipeline overview](docs/images/pipeline_cam1-ccd1.png)
-*One image, six pipeline stages: from raw TESS frame to attitude quaternion.*
+*Six pipeline stages: from raw TESS frame to attitude quaternion.*
 
 ---
 
@@ -36,13 +37,13 @@ not the accuracy bottleneck**; the optical-distortion calibration is.
 
 ## What this is
 
-A complete star-tracker pipeline that converts a single raw image of the sky into
-the camera's attitude quaternion. Validated on **real TESS satellite imagery** (not
-simulations), in true *lost-in-space* mode — no initial guess, no IMU prior, no
-catalog correspondences.
+A complete star-tracker pipeline that converts a single sky image into a camera
+attitude quaternion, given the camera's calibrated intrinsics. Validated on
+**real TESS satellite imagery** (not simulations), in true *lost-in-space*
+mode — no initial pose guess, no IMU prior, no catalog correspondences.
 
 ```
-        PNG image (2136 × 2078)
+        PNG image (2136 × 2078) + camera intrinsics (SIP + CRPIX + CD)
                 │
                 ▼
    ┌────────────────────────────┐
@@ -56,17 +57,22 @@ catalog correspondences.
                 │
                 ▼
    ┌────────────────────────────┐
-   │  Stage 3 — Triangle ID     │   RANSAC + Hipparcos pair-DB + Wahba SVD
+   │  Stage 3 — Triangle ID     │   RANSAC + Hipparcos pair-DB + 3-point Wahba SVD
    └────────────────────────────┘
                 │
                 ▼
    ┌────────────────────────────┐
-   │  Stage 4 — Plate-solve     │   scipy least-squares over (RA, Dec, roll)
+   │  Stage 4 — Refine R        │   Wahba refit on all verified detections
    └────────────────────────────┘
                 │
                 ▼
    ┌────────────────────────────┐
-   │  Stage 5 — Quality gate    │   honest "no-solution" if residual > 2 px
+   │  Stage 5 — Plate-solve     │   scipy least-squares over (RA, Dec, roll)
+   └────────────────────────────┘
+                │
+                ▼
+   ┌────────────────────────────┐
+   │  Stage 6 — Quality gate    │   honest "no-solution" if residual > 2 px
    └────────────────────────────┘
                 │
                 ▼
@@ -103,23 +109,36 @@ catalog correspondences.
 
 ## Try it
 
-### Interactive Streamlit walkthrough
+Requires Python ≥ 3.10.
 
 ```bash
 git clone https://github.com/SpaceDevEngineer/star-tracker.git
 cd star-tracker
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python3 -m pip install -r requirements.txt
+```
+
+> **First-run expectations.** The first invocation builds and caches a Hipparcos
+> pair-angle database (~60 s). RANSAC convergence is image-dependent: most
+> images run in 20–60 s on a modern laptop CPU; harder ones can take several
+> minutes. On Streamlit Cloud's free CPU tier expect 3–5 min per image.
+
+### Interactive Streamlit walkthrough
+
+```bash
 streamlit run Code/Streamlit_app/pipeline_app.py
 ```
 
-Opens at <http://localhost:8501>. Pick any of the 16 demo TESS images in the sidebar
-and press *Run pipeline*. Each stage materialises with the actual body vectors,
-triangle-angle table, plate-solve iterations, and final pose comparison.
+Opens at <http://localhost:8501>. Pick one of the 16 demo TESS images in the
+sidebar and press *Run pipeline*. Each stage materialises with the actual body
+vectors, triangle-angle table, plate-solve iterations, and a final pose
+comparison against the ground truth.
 
 ### End-to-end batch evaluation
 
 ```bash
-python Code/Star_ID/inference_full.py \
+python3 Code/Star_ID/inference_full.py \
     --data-dir Data/dataset_tess_test \
     --model    Results/unet_run3/best_model.pt \
     --catalog  Data/hybrid/catalog_hipparcos_full.csv \
@@ -127,19 +146,20 @@ python Code/Star_ID/inference_full.py \
     --out-dir  Results/star_id_run
 ```
 
-Writes per-image JSON artefacts and a summary table.
+Writes per-image JSON artefacts to `--out-dir` and prints a summary table
+(solve rate, median / 90th-pct / max error) to stdout.
 
 ### Generate the visualisations
 
 ```bash
-python Code/Star_ID/visualize_inference.py \
+python3 Code/Star_ID/visualize_inference.py \
     --data-dir Data/dataset_tess_test \
     --run-dir  Results/star_id_run \
     --out-dir  Results/star_id_run/viz
 ```
 
-Produces per-image overlays (detections + projected catalog + match lines), per-star
-residual maps, and a project summary chart.
+Produces per-image overlays (detections + projected catalog + match lines),
+per-star residual maps, and a project summary chart.
 
 ---
 

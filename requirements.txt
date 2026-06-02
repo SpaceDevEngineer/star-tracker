@@ -1,3 +1,9 @@
+# Python ≥ 3.10 required
+# PyTorch wheels: this file pulls the default (CPU) wheel from PyPI, which is
+# enough for inference on the bundled demo. For training or GPU inference, install
+# the platform-specific wheel from https://pytorch.org first, then `pip install
+# -r requirements.txt`.
+
 streamlit>=1.30
 torch>=2.0
 numpy>=1.24

@@ -5,6 +5,12 @@ learning + classical geometry.** Given a single image plus the camera's pre-cali
 intrinsics (SIP polynomial + CRPIX + CD shear — factory-calibrated, attitude-independent),
 the pipeline recovers a spacecraft's 3-axis orientation with no prior pose information.
 
+### 🎯 [Try the live interactive demo →](https://star-tracker-6vwnvtkvpow2eysg23i45l.streamlit.app)
+
+*Walks through every pipeline stage with the actual numbers (detections, triangle, plate-solve,
+quality gate, final pose) on 16 real TESS images. Replay mode renders in ~5 seconds; Live mode
+runs the full RANSAC + plate-solve.*
+
 ![Pipeline overview](docs/images/pipeline_cam1-ccd1.png)
 *Six pipeline stages: from raw TESS frame to attitude quaternion.*
 

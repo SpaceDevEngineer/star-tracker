@@ -34,10 +34,11 @@ from PIL import Image
 # Paths (resolved relative to this file so it works on Streamlit Cloud,
 # Codespaces, local clones, etc.)
 # ---------------------------------------------------------------------------
-PROJECT_DIR = Path(__file__).resolve().parents[2]
-MODEL_PATH  = PROJECT_DIR / "Results" / "unet_run3" / "best_model.pt"
-CATALOG_CSV = PROJECT_DIR / "Data" / "hybrid" / "catalog_hipparcos_full.csv"
-TEST_DIR    = PROJECT_DIR / "Data" / "dataset_tess_test"
+PROJECT_DIR  = Path(__file__).resolve().parents[2]
+MODEL_PATH   = PROJECT_DIR / "Results" / "unet_run3" / "best_model.pt"
+CATALOG_CSV  = PROJECT_DIR / "Data" / "hybrid" / "catalog_hipparcos_full.csv"
+TEST_DIR     = PROJECT_DIR / "Data" / "dataset_tess_test"
+ARTEFACT_DIR = PROJECT_DIR / "Results" / "star_id_run"
 
 sys.path.insert(0, str(PROJECT_DIR / "Code" / "Model_train_code"))
 sys.path.insert(0, str(PROJECT_DIR / "Code" / "Star_ID"))
@@ -89,9 +90,27 @@ st.caption("Lost-in-space attitude determination: PNG → quaternion. "
 # Sidebar — input + speed
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.header("⚡ Execution mode")
+    has_artefacts = ARTEFACT_DIR.exists() and any(ARTEFACT_DIR.glob("*.json"))
+    exec_default  = "Replay (instant)" if has_artefacts else "Live (slow, runs RANSAC)"
+    exec_mode = st.radio(
+        "How to run", ["Replay (instant)", "Live (slow, runs RANSAC)"],
+        index=0 if exec_default == "Replay (instant)" else 1,
+        help=("Replay loads pre-computed artefacts and renders every stage "
+              "instantly. Live actually runs the pipeline (CPU: 1–10 min per "
+              "image). The numbers are identical — Replay just skips the wait."),
+    )
+    is_replay = exec_mode.startswith("Replay")
+
+    st.markdown("---")
     st.header("📂 Input")
     test_images = sorted((TEST_DIR / "images").glob("*.png")) if TEST_DIR.exists() else []
-    mode = st.radio("Source", ["From test set", "Upload PNG"], index=0)
+    mode = st.radio("Source", ["From test set", "Upload PNG"], index=0,
+                     disabled=is_replay,
+                     help="Upload is disabled in Replay mode — only "
+                          "pre-computed images are available.")
+    if is_replay:
+        mode = "From test set"
 
     img_path = lbl_path = uploaded_img = uploaded_lbl = None
     if mode == "From test set":
@@ -112,7 +131,9 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("⚙️ Settings")
-    unet_thr = st.slider("U-Net detection threshold", 0.10, 0.95, 0.55, 0.05)
+    unet_thr = st.slider("U-Net detection threshold", 0.10, 0.95, 0.55, 0.05,
+                          disabled=is_replay,
+                          help="Used only in Live mode.")
     delay = st.slider("Animation delay between stages (s)", 0.0, 3.0, 0.6, 0.2,
                        help="Slow it down to watch each stage materialise.")
 
@@ -189,13 +210,29 @@ if not run_btn:
 # ---------------------------------------------------------------------------
 # Pipeline execution — stage by stage
 # ---------------------------------------------------------------------------
-model, device = load_model()
-identifier    = load_identifier()
-pose          = label["pose"]
-ps_arcsec     = pose["plate_scale_arcsec_per_pix"]
-ps_rad        = np.radians(ps_arcsec / 3600.0)
-wcs_full      = load_intrinsics_wcs(pose["wcs_header"])
+pose      = label["pose"]
+ps_arcsec = pose["plate_scale_arcsec_per_pix"]
+ps_rad    = np.radians(ps_arcsec / 3600.0)
+wcs_full  = load_intrinsics_wcs(pose["wcs_header"])
 intr_keys, cd_base, cd_base_roll = extract_camera_intrinsics(pose["wcs_header"])
+
+# Heavy loaders happen only in Live mode.
+model      = device = identifier = None
+artefact   = None
+if is_replay:
+    art_path = ARTEFACT_DIR / f"{img_path.stem}.json" if img_path else None
+    if art_path is None or not art_path.exists():
+        st.error(f"Replay mode requires a pre-computed artefact at "
+                  f"`{art_path}`, but it's missing. Pick another image or "
+                  f"switch to Live mode.")
+        st.stop()
+    artefact = json.load(open(art_path))
+    if artefact.get("failed"):
+        st.warning("This image was rejected by the quality gate during the "
+                   "original batch run — Replay will end at the gate stage.")
+else:
+    model, device = load_model()
+    identifier    = load_identifier()
 
 # ============================ STAGE 1 ===================================
 st.markdown("## Stage 1 — U-Net detection")
@@ -204,12 +241,21 @@ st.markdown(
     "extract local maxima from the heatmap above threshold, and reassemble back into image coords."
 )
 
-with st.status("🔁 Running U-Net on 16 tiles...", expanded=True) as s1:
-    t0 = time.time()
-    det_xy, det_b = detect_unet(model, img_np, device, threshold=unet_thr)
-    t_detect = time.time() - t0
-    st.write(f"**{len(det_xy)} centroids** found in {t_detect:.1f}s "
-              f"(threshold={unet_thr:.2f})")
+with st.status("🔁 Running U-Net on 16 tiles..." if not is_replay
+               else "📼 Loading pre-computed detections...",
+               expanded=True) as s1:
+    if is_replay:
+        det_xy = np.asarray(artefact["det_xy"])
+        t_detect = float(artefact.get("time_detect_s", 0.0))
+        det_b = None  # used only for flux sorting; in Replay we use det_xy_top directly
+        st.write(f"**{len(det_xy)} centroids** loaded from cached run "
+                  f"(original run-time: {t_detect:.1f}s on the laptop GPU).")
+    else:
+        t0 = time.time()
+        det_xy, det_b = detect_unet(model, img_np, device, threshold=unet_thr)
+        t_detect = time.time() - t0
+        st.write(f"**{len(det_xy)} centroids** found in {t_detect:.1f}s "
+                  f"(threshold={unet_thr:.2f})")
 
     fig, ax = plt.subplots(figsize=(9, 9))
     show_image_with_overlay(ax, img_np, vmin, vmax,
@@ -219,28 +265,34 @@ with st.status("🔁 Running U-Net on 16 tiles...", expanded=True) as s1:
     ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
     st.pyplot(fig, use_container_width=True)
 
-    st.markdown("**What the U-Net actually outputs** (centre tile, raw heatmap):")
-    row0 = (img_h - TILE_SIZE) // 2
-    col0 = (img_w - TILE_SIZE) // 2
-    tile = img_np[row0:row0+TILE_SIZE, col0:col0+TILE_SIZE]
-    with torch.no_grad():
-        heatmap = model(torch.tensor(tile[None, None]).to(device)).cpu().numpy().squeeze()
-    centroids_local = np.asarray(extract_centroids(heatmap, threshold=unet_thr))
+    if is_replay:
+        st.caption(
+            "Live mode also shows the raw U-Net heatmap on the centre tile; "
+            "Replay skips that one model forward pass for instant playback."
+        )
+    else:
+        st.markdown("**What the U-Net actually outputs** (centre tile, raw heatmap):")
+        row0 = (img_h - TILE_SIZE) // 2
+        col0 = (img_w - TILE_SIZE) // 2
+        tile = img_np[row0:row0+TILE_SIZE, col0:col0+TILE_SIZE]
+        with torch.no_grad():
+            heatmap = model(torch.tensor(tile[None, None]).to(device)).cpu().numpy().squeeze()
+        centroids_local = np.asarray(extract_centroids(heatmap, threshold=unet_thr))
 
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 6))
-    axL.imshow(tile, cmap="gray", vmin=vmin, vmax=vmax, origin="upper")
-    axL.set_title(f"Input tile ({TILE_SIZE}×{TILE_SIZE})")
-    axL.set_xticks([]); axL.set_yticks([])
-    axR.imshow(tile, cmap="gray", vmin=vmin, vmax=vmax, origin="upper")
-    axR.imshow(heatmap, cmap="hot", alpha=0.55, vmin=0, vmax=1, origin="upper")
-    if len(centroids_local) > 0:
-        axR.scatter(centroids_local[:, 0], centroids_local[:, 1],
-                    facecolors="none", edgecolors="cyan", s=22, linewidths=0.7,
-                    label=f"{len(centroids_local)} peaks")
-    axR.legend(loc="upper right", fontsize=9)
-    axR.set_title("U-Net heatmap + extracted centroids")
-    axR.set_xticks([]); axR.set_yticks([])
-    st.pyplot(fig, use_container_width=True)
+        fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 6))
+        axL.imshow(tile, cmap="gray", vmin=vmin, vmax=vmax, origin="upper")
+        axL.set_title(f"Input tile ({TILE_SIZE}×{TILE_SIZE})")
+        axL.set_xticks([]); axL.set_yticks([])
+        axR.imshow(tile, cmap="gray", vmin=vmin, vmax=vmax, origin="upper")
+        axR.imshow(heatmap, cmap="hot", alpha=0.55, vmin=0, vmax=1, origin="upper")
+        if len(centroids_local) > 0:
+            axR.scatter(centroids_local[:, 0], centroids_local[:, 1],
+                        facecolors="none", edgecolors="cyan", s=22, linewidths=0.7,
+                        label=f"{len(centroids_local)} peaks")
+        axR.legend(loc="upper right", fontsize=9)
+        axR.set_title("U-Net heatmap + extracted centroids")
+        axR.set_xticks([]); axR.set_yticks([])
+        st.pyplot(fig, use_container_width=True)
     s1.update(label=f"✅ Stage 1 — {len(det_xy)} detections", state="complete")
 
 time.sleep(delay)
@@ -258,9 +310,19 @@ st.markdown(
 )
 
 with st.status("🔁 Computing body vectors...", expanded=True) as s2:
-    bright_order = np.argsort(-det_b)
-    top_idx      = bright_order[:60]
-    det_xy_top   = det_xy[top_idx]
+    if is_replay:
+        det_xy_top = np.asarray(artefact["det_xy_top"])
+        # Re-derive the top-N positional indices into det_xy for the table view.
+        top_idx = []
+        for tx, ty in det_xy_top:
+            dist = np.hypot(det_xy[:, 0] - tx, det_xy[:, 1] - ty)
+            top_idx.append(int(np.argmin(dist)))
+        top_idx = np.asarray(top_idx)
+        det_b = np.zeros(len(det_xy), dtype=np.float32)  # not used past this point in Replay
+    else:
+        bright_order = np.argsort(-det_b)
+        top_idx      = bright_order[:60]
+        det_xy_top   = det_xy[top_idx]
     body_vecs     = pixels_to_body_vecs(np.asarray(det_xy_top), wcs_full, ps_rad)
     body_vecs_all = pixels_to_body_vecs(np.asarray(det_xy),     wcs_full, ps_rad)
     st.write(f"Selected **top-{len(det_xy_top)}** brightest detections.")
@@ -308,53 +370,88 @@ st.markdown(
     "Compute Wahba rotation, verify on all detections."
 )
 
-with st.status("🔁 RANSAC searching for a valid triangle "
-               "(up to 1500 iterations)...", expanded=True) as s3:
-    t1 = time.time()
-    id_result = identifier.identify(
-        body_vecs, verify_body_vecs=body_vecs_all,
-        tol_arcsec=ANGLE_TOL_ARCSEC,
-        verify_tol_arcsec=VERIFY_TOL_ARCSEC,
-        verbose=False,
-    )
-    t_identify = time.time() - t1
-    if id_result is None:
-        s3.update(label="❌ RANSAC failed — no valid triangle found", state="error")
-        st.error("Pipeline aborted: no triangle ≥ 10 verified matches.")
-        st.stop()
+with st.status(
+    "📼 Loading cached triangle from previous RANSAC run..." if is_replay
+    else "🔁 RANSAC searching for a valid triangle (up to 1500 iterations)...",
+    expanded=True,
+) as s3:
+    if is_replay:
+        di, dj, dk, ci, cj, ck = artefact["triangle"]
+        iterations = artefact.get("iterations", 0)
+        n_matched_id = artefact.get("n_matched_id", 0)
+        t_identify = float(artefact.get("time_identify_s", 0.0))
 
-    di, dj, dk, ci, cj, ck = id_result.triangle
-    st.write(f"**Found a valid triangle after {id_result.iterations} iterations** in {t_identify:.1f}s.")
+        st.write(f"**Cached triangle was found at iteration {iterations}** "
+                  f"(original RANSAC took {t_identify:.1f}s).")
+    else:
+        t1 = time.time()
+        id_result = identifier.identify(
+            body_vecs, verify_body_vecs=body_vecs_all,
+            tol_arcsec=ANGLE_TOL_ARCSEC,
+            verify_tol_arcsec=VERIFY_TOL_ARCSEC,
+            verbose=False,
+        )
+        t_identify = time.time() - t1
+        if id_result is None:
+            s3.update(label="❌ RANSAC failed — no valid triangle found", state="error")
+            st.error("Pipeline aborted: no triangle ≥ 10 verified matches.")
+            st.stop()
+
+        di, dj, dk, ci, cj, ck = id_result.triangle
+        iterations   = id_result.iterations
+        n_matched_id = id_result.score
+        st.write(f"**Found a valid triangle after {iterations} iterations** in {t_identify:.1f}s.")
+
     st.write(f"Detection vertices (indices into top-60): **A={di}**, **B={dj}**, **C={dk}**")
-    st.write(f"Catalog matches (Hipparcos IDs): "
-              f"**A→{identifier.db.star_ids[ci]}**, "
-              f"**B→{identifier.db.star_ids[cj]}**, "
-              f"**C→{identifier.db.star_ids[ck]}**")
-    st.write(f"Pass-1 verified matches at 200″ tolerance: **{id_result.score}**")
+    if not is_replay:
+        st.write(f"Catalog matches (Hipparcos IDs): "
+                  f"**A→{identifier.db.star_ids[ci]}**, "
+                  f"**B→{identifier.db.star_ids[cj]}**, "
+                  f"**C→{identifier.db.star_ids[ck]}**")
+    else:
+        st.write(f"Catalog matches (pattern-DB indices): "
+                  f"**A→{ci}**, **B→{cj}**, **C→{ck}**")
+    st.write(f"Pass-1 verified matches at 200″ tolerance: **{n_matched_id}**")
 
-    # Compute the 3 triangle angles
     bi, bj, bk = body_vecs[di], body_vecs[dj], body_vecs[dk]
     θ_ij = np.degrees(np.arccos(np.clip(np.dot(bi, bj), -1, 1))) * 3600
     θ_ik = np.degrees(np.arccos(np.clip(np.dot(bi, bk), -1, 1))) * 3600
     θ_jk = np.degrees(np.arccos(np.clip(np.dot(bj, bk), -1, 1))) * 3600
-    vi, vj, vk = identifier.db.star_vecs[ci], identifier.db.star_vecs[cj], identifier.db.star_vecs[ck]
-    Θ_ij = np.degrees(np.arccos(np.clip(np.dot(vi, vj), -1, 1))) * 3600
-    Θ_ik = np.degrees(np.arccos(np.clip(np.dot(vi, vk), -1, 1))) * 3600
+
+    if is_replay:
+        Θ_ij = Θ_ik = Θ_jk = None
+    else:
+        vi, vj, vk = identifier.db.star_vecs[ci], identifier.db.star_vecs[cj], identifier.db.star_vecs[ck]
+        Θ_ij = np.degrees(np.arccos(np.clip(np.dot(vi, vj), -1, 1))) * 3600
+        Θ_ik = np.degrees(np.arccos(np.clip(np.dot(vi, vk), -1, 1))) * 3600
     Θ_jk = np.degrees(np.arccos(np.clip(np.dot(vj, vk), -1, 1))) * 3600
 
-    st.markdown("**Pairwise angles** — detection triangle vs catalog triangle:")
-    angle_table = pd.DataFrame({
-        "pair":           ["A–B", "A–C", "B–C"],
-        "body (arcsec)":  [f"{θ_ij:.2f}", f"{θ_ik:.2f}", f"{θ_jk:.2f}"],
-        "catalog (arcsec)": [f"{Θ_ij:.2f}", f"{Θ_ik:.2f}", f"{Θ_jk:.2f}"],
-        "Δ (arcsec)":      [f"{θ_ij-Θ_ij:+.2f}", f"{θ_ik-Θ_ik:+.2f}", f"{θ_jk-Θ_jk:+.2f}"],
-    })
-    st.dataframe(angle_table, use_container_width=True, hide_index=True)
+    if is_replay:
+        st.markdown("**Pairwise angles** — body-frame triangle from cached centroids:")
+        angle_table = pd.DataFrame({
+            "pair":          ["A–B", "A–C", "B–C"],
+            "body (arcsec)": [f"{θ_ij:.2f}", f"{θ_ik:.2f}", f"{θ_jk:.2f}"],
+        })
+        st.dataframe(angle_table, use_container_width=True, hide_index=True)
+        st.caption("Live mode also shows the catalog-side angles and their delta; "
+                   "Replay omits them to avoid loading the 82 MB pattern DB.")
+    else:
+        Θ_jk = np.degrees(np.arccos(np.clip(np.dot(vj, vk), -1, 1))) * 3600
+        st.markdown("**Pairwise angles** — detection triangle vs catalog triangle:")
+        angle_table = pd.DataFrame({
+            "pair":             ["A–B", "A–C", "B–C"],
+            "body (arcsec)":    [f"{θ_ij:.2f}", f"{θ_ik:.2f}", f"{θ_jk:.2f}"],
+            "catalog (arcsec)": [f"{Θ_ij:.2f}", f"{Θ_ik:.2f}", f"{Θ_jk:.2f}"],
+            "Δ (arcsec)":       [f"{θ_ij-Θ_ij:+.2f}",
+                                 f"{θ_ik-Θ_ik:+.2f}",
+                                 f"{θ_jk-Θ_jk:+.2f}"],
+        })
+        st.dataframe(angle_table, use_container_width=True, hide_index=True)
 
     tri_pix = det_xy_top[[di, dj, dk]]
     fig, ax = plt.subplots(figsize=(9, 9))
     show_image_with_overlay(ax, img_np, vmin, vmax,
-        f"Stage 3: RANSAC triangle (iteration {id_result.iterations})")
+        f"Stage 3: RANSAC triangle (iteration {iterations})")
     ax.scatter(det_xy_top[:, 0], det_xy_top[:, 1], facecolors="none",
                 edgecolors="yellow", s=25, linewidths=0.6, alpha=0.5)
     tri_poly = Polygon(tri_pix, closed=True, fill=False, edgecolor="lime",
@@ -367,7 +464,7 @@ with st.status("🔁 RANSAC searching for a valid triangle "
                     textcoords="offset points", color="lime",
                     fontsize=14, fontweight="bold")
     st.pyplot(fig, use_container_width=True)
-    s3.update(label=f"✅ Stage 3 — triangle found in {id_result.iterations} iters", state="complete")
+    s3.update(label=f"✅ Stage 3 — triangle found in {iterations} iters", state="complete")
 
 time.sleep(delay)
 
@@ -380,7 +477,15 @@ st.markdown(
 )
 
 with st.status("🔁 Solving Wahba SVD on 3 pairs + verifying...", expanded=True) as s4:
-    R_id = id_result.R
+    if is_replay:
+        ra_pred, dec_pred, roll_pred = artefact["pose_pred"]
+        R_pred = _R_from_pose(ra_pred, dec_pred, roll_pred)
+        R_id = R_pred
+        st.caption("Replay shows the final refined rotation matrix — the rough "
+                   "3-point R is not separately saved in the artefact. The "
+                   "numerical structure is identical.")
+    else:
+        R_id = id_result.R
     st.write("**Rotation matrix R (body → ICRS):**")
     st.code(np.array2string(R_id, formatter={'float': lambda x: f"{x:+.5f}"},
                               prefix="R = "), language="text")
@@ -390,9 +495,10 @@ with st.status("🔁 Solving Wahba SVD on 3 pairs + verifying...", expanded=True
     dec_est = np.degrees(np.arcsin(np.clip(boresight[2], -1, 1)))
     st.write(f"**Decoded approximate boresight**: RA ≈ {ra_est:.3f}°, Dec ≈ {dec_est:.3f}°")
     st.write(f"**Verified on all {len(body_vecs_all)} detections**: "
-              f"**{id_result.score} matches** within {VERIFY_TOL_ARCSEC:.0f}″ tolerance")
+              f"**{n_matched_id} matches** within {VERIFY_TOL_ARCSEC:.0f}″ tolerance")
 
-    s4.update(label=f"✅ Stage 4 — rough R found ({id_result.score} initial matches)", state="complete")
+    s4.update(label=f"✅ Stage 4 — rough R found ({n_matched_id} initial matches)",
+              state="complete")
 
 time.sleep(delay)
 
@@ -404,93 +510,112 @@ st.markdown(
     "We iterate — project catalog, snap detections to nearest projection at progressively tighter tolerance (30→5→1.5 px), re-solve."
 )
 
-with st.status("🔁 Plate-solve refinement (3 inner iterations)...", expanded=True) as s5:
-    def matches_to_pairs(matches):
-        di_list = list(matches.keys()); ci_list = list(matches.values())
-        v = identifier.db.star_vecs[ci_list]
-        dec = np.degrees(np.arcsin(np.clip(v[:, 2], -1, 1)))
-        ra  = np.degrees(np.arctan2(v[:, 1], v[:, 0])) % 360
-        return np.asarray(det_xy)[di_list], np.stack([ra, dec], axis=-1)
+with st.status("🔁 Plate-solve refinement (3 inner iterations)..." if not is_replay
+               else "📼 Loading cached plate-solve result...",
+               expanded=True) as s5:
+    if is_replay:
+        pose_pred = tuple(artefact["pose_pred"])
+        median_px_res = float(artefact.get("median_px_residual", float("nan")))
+        n_matched = int(artefact.get("n_matched", len(artefact.get("matched_pairs", []))))
+        history = [{
+            "iter":          "cached final",
+            "tol_px":        "1.5",
+            "matches":       n_matched,
+            "median_res_px": f"{median_px_res:.3f}",
+            "RA":            f"{pose_pred[0]:.4f}",
+            "Dec":           f"{pose_pred[1]:.4f}",
+            "roll":          f"{pose_pred[2]:.4f}",
+        }]
+        st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
+        st.caption("Live mode shows the four inner iterations of the plate-solve "
+                   "loop tightening from 30 px to 1.5 px tolerance; the cached "
+                   "artefact only stores the final converged result.")
+    else:
+        def matches_to_pairs(matches):
+            di_list = list(matches.keys()); ci_list = list(matches.values())
+            v = identifier.db.star_vecs[ci_list]
+            dec = np.degrees(np.arcsin(np.clip(v[:, 2], -1, 1)))
+            ra  = np.degrees(np.arctan2(v[:, 1], v[:, 0])) % 360
+            return np.asarray(det_xy)[di_list], np.stack([ra, dec], axis=-1)
 
-    # Final Wahba refit on the Pass-1 matches so plate-solve starts from a clean R.
-    R = R_id
-    verify_tol_rad = np.radians(VERIFY_TOL_ARCSEC / 3600.0)
-    all_matches = id_result.matches
-    for _ in range(2):
-        body_in_icrs = body_vecs_all @ R.T
-        dots = body_in_icrs @ identifier.db.star_vecs.T
-        cos_tol = np.cos(verify_tol_rad)
-        best_cat = np.argmax(dots, axis=1)
-        best_score = dots[np.arange(len(body_vecs_all)), best_cat]
-        order = np.argsort(-best_score)
-        all_matches = {}; used_cat = set()
-        for d_idx in order:
-            c_idx = int(best_cat[d_idx])
-            if best_score[d_idx] >= cos_tol and c_idx not in used_cat:
-                all_matches[int(d_idx)] = c_idx
-                used_cat.add(c_idx)
-        if len(all_matches) < 4: break
-        body_p = [body_vecs_all[d_idx] for d_idx in all_matches.keys()]
-        ref_p  = [identifier.db.star_vecs[c_idx] for c_idx in all_matches.values()]
-        B = sum(np.outer(rr, bb) for bb, rr in zip(body_p, ref_p))
-        U, _, Vt = np.linalg.svd(B)
-        ds = np.linalg.det(U) * np.linalg.det(Vt)
-        R = U @ np.diag([1., 1., ds]) @ Vt
-
-    # Seed the plate-solver at the direction R sends CRPIX (not the image centre).
-    crpix = np.array([[float(pose["wcs_header"]["CRPIX1"]),
-                       float(pose["wcs_header"]["CRPIX2"])]])
-    body_crpix = pixels_to_body_vecs(crpix, wcs_full, ps_rad)[0]
-    icrs_crpix = R @ body_crpix
-    ra_init  = float(np.degrees(np.arctan2(icrs_crpix[1], icrs_crpix[0]))) % 360.0
-    dec_init = float(np.degrees(np.arcsin(np.clip(icrs_crpix[2], -1, 1))))
-    pose_pred = (ra_init, dec_init, cd_base_roll)
-
-    pix_in, rdc_in = matches_to_pairs(all_matches)
-    history = []
-    if len(pix_in) >= 4:
-        ra, dec, roll, cost, final_res = plate_solve(
-            pix_in, rdc_in, intr_keys, cd_base, cd_base_roll, pose_pred)
-        pose_pred = (ra, dec, roll)
-        history.append({"iter": "init", "tol_px": "—", "matches": len(all_matches),
-                        "median_res_px": f"{float(np.median(np.abs(final_res))):.3f}",
-                        "RA": f"{ra:.4f}", "Dec": f"{dec:.4f}", "roll": f"{roll:.4f}"})
-
-        # Inner loop: project catalog through current WCS, snap matches at
-        # tightening pixel tolerance, re-solve.
-        for tol_pix in (30.0, 5.0, 1.5):
-            w_cand = build_pose_wcs(*pose_pred, intr_keys, cd_base, cd_base_roll)
-            new_matches = refine_matches_by_projection(
-                w_cand, det_xy, identifier, img_w, img_h, tol_pix=tol_pix)
-            if len(new_matches) < 4:
+        R = R_id
+        verify_tol_rad = np.radians(VERIFY_TOL_ARCSEC / 3600.0)
+        all_matches = id_result.matches
+        for _ in range(2):
+            body_in_icrs = body_vecs_all @ R.T
+            dots = body_in_icrs @ identifier.db.star_vecs.T
+            cos_tol = np.cos(verify_tol_rad)
+            best_cat = np.argmax(dots, axis=1)
+            best_score = dots[np.arange(len(body_vecs_all)), best_cat]
+            order = np.argsort(-best_score)
+            all_matches = {}; used_cat = set()
+            for d_idx in order:
+                c_idx = int(best_cat[d_idx])
+                if best_score[d_idx] >= cos_tol and c_idx not in used_cat:
+                    all_matches[int(d_idx)] = c_idx
+                    used_cat.add(c_idx)
+            if len(all_matches) < 4:
                 break
-            pix_in, rdc_in = matches_to_pairs(new_matches)
+            body_p = [body_vecs_all[d_idx] for d_idx in all_matches.keys()]
+            ref_p  = [identifier.db.star_vecs[c_idx] for c_idx in all_matches.values()]
+            B = sum(np.outer(rr, bb) for bb, rr in zip(body_p, ref_p))
+            U, _, Vt = np.linalg.svd(B)
+            ds = np.linalg.det(U) * np.linalg.det(Vt)
+            R = U @ np.diag([1., 1., ds]) @ Vt
+
+        # Seed the plate-solver at the direction R sends CRPIX (not the image centre).
+        crpix = np.array([[float(pose["wcs_header"]["CRPIX1"]),
+                           float(pose["wcs_header"]["CRPIX2"])]])
+        body_crpix = pixels_to_body_vecs(crpix, wcs_full, ps_rad)[0]
+        icrs_crpix = R @ body_crpix
+        ra_init  = float(np.degrees(np.arctan2(icrs_crpix[1], icrs_crpix[0]))) % 360.0
+        dec_init = float(np.degrees(np.arcsin(np.clip(icrs_crpix[2], -1, 1))))
+        pose_pred = (ra_init, dec_init, cd_base_roll)
+
+        pix_in, rdc_in = matches_to_pairs(all_matches)
+        history = []
+        if len(pix_in) >= 4:
             ra, dec, roll, cost, final_res = plate_solve(
-                pix_in, rdc_in, intr_keys, cd_base, cd_base_roll, pose_pred,
-                bounds_deg=0.5, roll_bounds_deg=5.0)
+                pix_in, rdc_in, intr_keys, cd_base, cd_base_roll, pose_pred)
             pose_pred = (ra, dec, roll)
-            all_matches = new_matches
-            history.append({"iter": f"tol={tol_pix} px",
-                            "tol_px": f"{tol_pix:.1f}",
-                            "matches": len(all_matches),
+            history.append({"iter": "init", "tol_px": "—", "matches": len(all_matches),
                             "median_res_px": f"{float(np.median(np.abs(final_res))):.3f}",
                             "RA": f"{ra:.4f}", "Dec": f"{dec:.4f}", "roll": f"{roll:.4f}"})
 
-    st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
-    median_px_res = float(np.median(np.abs(final_res)))
-    s5.update(label=f"✅ Stage 5 — plate-solved ({len(all_matches)} matches, "
+            for tol_pix in (30.0, 5.0, 1.5):
+                w_cand = build_pose_wcs(*pose_pred, intr_keys, cd_base, cd_base_roll)
+                new_matches = refine_matches_by_projection(
+                    w_cand, det_xy, identifier, img_w, img_h, tol_pix=tol_pix)
+                if len(new_matches) < 4:
+                    break
+                pix_in, rdc_in = matches_to_pairs(new_matches)
+                ra, dec, roll, cost, final_res = plate_solve(
+                    pix_in, rdc_in, intr_keys, cd_base, cd_base_roll, pose_pred,
+                    bounds_deg=0.5, roll_bounds_deg=5.0)
+                pose_pred = (ra, dec, roll)
+                all_matches = new_matches
+                history.append({"iter": f"tol={tol_pix} px",
+                                "tol_px": f"{tol_pix:.1f}",
+                                "matches": len(all_matches),
+                                "median_res_px": f"{float(np.median(np.abs(final_res))):.3f}",
+                                "RA": f"{ra:.4f}", "Dec": f"{dec:.4f}", "roll": f"{roll:.4f}"})
+
+        st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
+        median_px_res = float(np.median(np.abs(final_res)))
+        n_matched = len(all_matches)
+    s5.update(label=f"✅ Stage 5 — plate-solved ({n_matched} matches, "
                     f"{median_px_res:.3f} px residual)", state="complete")
 
 time.sleep(delay)
 
 # ============================ STAGE 6 ===================================
 st.markdown("## Stage 6 — Quality gate")
-quality_ok = median_px_res < 2.0 and len(all_matches) >= 8
+quality_ok = median_px_res < 2.0 and n_matched >= 8
 if quality_ok:
     st.success(f"✅ **PASS** — median residual {median_px_res:.3f} px < 2 px, "
-                f"{len(all_matches)} matches ≥ 8.")
+                f"{n_matched} matches ≥ 8.")
 else:
-    st.error(f"❌ **FAIL** — residual {median_px_res:.2f} px or only {len(all_matches)} matches. "
+    st.error(f"❌ **FAIL** — residual {median_px_res:.2f} px or only {n_matched} matches. "
               f"Would mark this image as a 'no lock' rather than emit a wrong attitude.")
 
 time.sleep(delay)
@@ -510,29 +635,38 @@ err     = angular_error_arcsec(q_pred, q_gt)
 c1, c2 = st.columns(2)
 with c1:
     st.metric("Angular error", f"{err:.2f}″", f"{err/ps_arcsec:.3f} px")
-    st.metric("Verified matches", len(all_matches))
+    st.metric("Verified matches", n_matched)
 with c2:
     st.metric("Median pixel residual", f"{median_px_res:.3f} px")
-    st.metric("Total time",
+    st.metric("Pipeline time",
               f"{t_detect + t_identify:.1f}s",
-              help="U-Net detect + RANSAC + plate-solve")
+              help="U-Net detect + RANSAC + plate-solve (original run)")
 
 st.markdown("**Pose comparison (predicted vs ground-truth):**")
 st.dataframe(pd.DataFrame({
-    "parameter": ["RA (deg)", "Dec (deg)", "Roll (deg)"],
-    "predicted": [f"{pose_pred[0]:.5f}", f"{pose_pred[1]:.5f}", f"{pose_pred[2]:.5f}"],
-    "GT (CRVAL/CD)":   [f"{ra_gt:.5f}",     f"{dec_gt:.5f}",     f"{roll_gt:.5f}"],
-    "Δ":          [f"{pose_pred[0]-ra_gt:+.5f}", f"{pose_pred[1]-dec_gt:+.5f}", f"{pose_pred[2]-roll_gt:+.5f}"],
+    "parameter":      ["RA (deg)", "Dec (deg)", "Roll (deg)"],
+    "predicted":      [f"{pose_pred[0]:.5f}", f"{pose_pred[1]:.5f}", f"{pose_pred[2]:.5f}"],
+    "GT (CRVAL/CD)":  [f"{ra_gt:.5f}",         f"{dec_gt:.5f}",       f"{roll_gt:.5f}"],
+    "Δ":              [f"{pose_pred[0]-ra_gt:+.5f}",
+                       f"{pose_pred[1]-dec_gt:+.5f}",
+                       f"{pose_pred[2]-roll_gt:+.5f}"],
 }), use_container_width=True, hide_index=True)
 
-# Final overlay
-st.markdown("**Final overlay**: red = U-Net detections, cyan = projected catalog via predicted attitude, "
-            "lime lines = matched pairs.")
+st.markdown("**Final overlay**: red = U-Net detections, cyan = projected catalog "
+            "via predicted attitude, lime lines = matched pairs.")
 wcs_pred = build_pose_wcs(*pose_pred, intr_keys, cd_base, cd_base_roll)
-cat_idx_list = list(all_matches.values())
-cat_v = identifier.db.star_vecs[cat_idx_list]
-cat_ra  = np.degrees(np.arctan2(cat_v[:, 1], cat_v[:, 0])) % 360
-cat_dec = np.degrees(np.arcsin(np.clip(cat_v[:, 2], -1, 1)))
+
+if is_replay:
+    mp = artefact.get("matched_pairs", [])
+    cat_ra  = np.array([m["ra_deg"]  for m in mp])
+    cat_dec = np.array([m["dec_deg"] for m in mp])
+    mp_px   = np.array([(m["px"], m["py"]) for m in mp])
+else:
+    cat_idx_list = list(all_matches.values())
+    cat_v = identifier.db.star_vecs[cat_idx_list]
+    cat_ra  = np.degrees(np.arctan2(cat_v[:, 1], cat_v[:, 0])) % 360
+    cat_dec = np.degrees(np.arcsin(np.clip(cat_v[:, 2], -1, 1)))
+    mp_px   = np.asarray(det_xy)[list(all_matches.keys())]
 px_proj, py_proj = wcs_pred.all_world2pix(cat_ra, cat_dec, 0)
 
 fig, ax = plt.subplots(figsize=(10, 10))
@@ -540,7 +674,6 @@ show_image_with_overlay(ax, img_np, vmin, vmax,
     f"Final result — angular error {err:.2f}″ ({err/ps_arcsec:.2f} px)")
 ax.scatter(det_xy[:, 0], det_xy[:, 1], facecolors="none", edgecolors="red",
             s=15, linewidths=0.4, alpha=0.5)
-mp_px = np.asarray(det_xy)[list(all_matches.keys())]
 for (mx, my), (pxp, pyp) in zip(mp_px, zip(px_proj, py_proj)):
     ax.plot([mx, pxp], [my, pyp], "-", c="lime", linewidth=0.7)
 ax.scatter(mp_px[:, 0], mp_px[:, 1], facecolors="none", edgecolors="red",

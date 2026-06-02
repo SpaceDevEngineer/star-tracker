@@ -21,8 +21,9 @@ env/
 # Pattern DB is regenerated from catalog at first run (~60s, then cached)
 Data/hybrid/pattern_db_*.pkl
 
-# Runtime artefacts
-Results/star_id_run/
+# Runtime artefacts (but keep the pre-computed Replay-mode JSON snapshots)
+Results/star_id_run/*
+!Results/star_id_run/*.json
 *.log
 *.tmp
 

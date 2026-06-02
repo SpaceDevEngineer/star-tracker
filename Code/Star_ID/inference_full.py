@@ -1,18 +1,16 @@
 """
-inference_full.py — REAL star tracker pipeline (no --use-gt cheating).
+End-to-end lost-in-space attitude pipeline.
 
-Full pipeline:
-    PNG → U-Net detection → body vectors →
-    Triangle Star ID → catalog matches →
-    Wahba SVD → quaternion → angular error
-
-This is what would run on a satellite in "lost in space" mode.
+Stages:
+    PNG → U-Net detection → SIP-corrected body vectors → Triangle Star ID
+    → Wahba SVD → plate-solve refinement → quality gate → attitude quaternion
 
 Usage:
     python inference_full.py \
-        --data-dir /Users/timon/Desktop/Thesis/Data/dataset_tess_test \
-        --model    /Users/timon/Desktop/Thesis/Results/unet_run3/best_model.pt \
-        --catalog  /Users/timon/Desktop/Thesis/Data/hybrid/catalog_hipparcos_full.csv
+        --data-dir <dataset>/dataset_tess_test \
+        --model    <results>/unet_run3/best_model.pt \
+        --catalog  <data>/hybrid/catalog_hipparcos_full.csv \
+        --out-dir  <results>/star_id_run
 """
 
 import argparse
@@ -31,12 +29,9 @@ from scipy.optimize import least_squares
 
 warnings.filterwarnings("ignore", module="astropy")
 
-# Star ID
 from triangle_id import StarIdentifier
 
-# U-Net pipeline
-CODE_DIR = Path(__file__).parent.parent / "Model_train_code"
-sys.path.insert(0, str(CODE_DIR))
+sys.path.insert(0, str(Path(__file__).parent.parent / "Model_train_code"))
 from train import UNet, extract_centroids
 
 TILE_SIZE = 512
@@ -62,19 +57,11 @@ def radec_to_unit_vec(ra_deg, dec_deg):
 
 def pixels_to_body_vecs(xy, wcs_full, ps_rad):
     """
-    Pixel→body unit vector in a CAMERA-FIXED frame (no attitude required).
+    Pixel → body unit vector in a camera-fixed frame.
 
-    Body axes:
-      - body_x = camera boresight
-      - body_y, body_z = camera focal plane axes (rotated by `roll` from sky)
-
-    Steps:
-      1. `sip_pix2foc` removes SIP optical distortion → undistorted focal-plane
-         coords (already CRPIX-subtracted).
-      2. Tangent (gnomonic) projection from focal-plane → unit vector.
-
-    Sign convention (1, -foc_x*ps, -foc_y*ps) is empirically calibrated
-    against this TESS dataset's labels (smallest Wahba-fit residual).
+    Removes SIP optical distortion via `sip_pix2foc`, then applies a tangent
+    (gnomonic) projection from the focal plane to a unit vector. The resulting
+    body frame is independent of attitude — only camera intrinsics are used.
     """
     if len(xy) == 0:
         return np.zeros((0, 3), dtype=np.float64)
@@ -87,10 +74,9 @@ def pixels_to_body_vecs(xy, wcs_full, ps_rad):
 
 def _gt_R_from_label(label, wcs_full, ps_rad, identifier):
     """
-    Wahba-best-fit R for the label's known (pixel, hipparcos_id) pairs in our
-    camera-fixed body frame. This is the proper reference attitude to score
-    a star-ID prediction against; the labels' stored quaternion uses a
-    different body convention and is not directly comparable.
+    Wahba-best-fit reference attitude from the label's (pixel, hipparcos_id)
+    pairs, expressed in the same body frame the predictor uses. Needed because
+    the labels' stored quaternion is in a different body convention.
     """
     hip_to_idx = {int(h): i for i, h in enumerate(identifier.db.star_ids)}
     pairs_r, pixel_xy = [], []
@@ -110,17 +96,18 @@ def _gt_R_from_label(label, wcs_full, ps_rad, identifier):
 
 
 # ---------------------------------------------------------------------------
-# Two-pass refinement (Strategy 1) + plate-solve (Strategy 2)
+# WCS synthesis + plate-solve
 # ---------------------------------------------------------------------------
 def extract_camera_intrinsics(wcs_dict):
-    """Extract camera-intrinsic WCS parts: SIP polynomial, CRPIX, CD matrix,
-    CTYPE/CUNIT. We treat CD as a camera intrinsic because it encodes per-CCD
-    plate-scale anisotropy/shear (small but non-zero on TESS).
+    """
+    Separate camera intrinsics (SIP, CRPIX, CD shear) from attitude (CRVAL,
+    overall rotation). CD is treated as an intrinsic because the per-CCD
+    plate-scale anisotropy and shear are factory-calibrated camera properties.
 
     Returns:
-        intr_keys : dict of header fields to copy unchanged
-        cd_base   : (2,2) the labels' CD matrix
-        cd_roll   : the roll baked into cd_base (deg)
+        intr_keys : header fields copied verbatim into every synthesized WCS
+        cd_base   : (2, 2) reference CD matrix
+        cd_roll   : roll angle (deg) baked into cd_base
     """
     keep_exact = {"CTYPE1", "CTYPE2", "CUNIT1", "CUNIT2", "RADESYS", "EQUINOX",
                   "WCSAXES", "CRPIX1", "CRPIX2"}
@@ -128,7 +115,6 @@ def extract_camera_intrinsics(wcs_dict):
     intr_keys = {k: v for k, v in wcs_dict.items()
                  if k in keep_exact or any(k.startswith(p) for p in keep_prefix)}
 
-    # Reconstruct the CD matrix from either CD* or PC*+CDELT*
     if "CD1_1" in wcs_dict:
         cd = np.array([[wcs_dict["CD1_1"], wcs_dict["CD1_2"]],
                        [wcs_dict["CD2_1"], wcs_dict["CD2_2"]]], dtype=np.float64)
@@ -161,7 +147,7 @@ def build_pose_wcs(ra_b_deg, dec_b_deg, roll_deg, intr_keys, cd_base, cd_base_ro
     hdr["CRVAL2"] = float(dec_b_deg)
     hdr["CD1_1"], hdr["CD1_2"] = float(cd[0, 0]), float(cd[0, 1])
     hdr["CD2_1"], hdr["CD2_2"] = float(cd[1, 0]), float(cd[1, 1])
-    # Strip stale PC/CDELT keys that astropy would otherwise compose with CD
+    # Astropy composes PC*CDELT *with* CD if both are present; drop the former.
     for k in ("PC1_1", "PC1_2", "PC2_1", "PC2_2", "CDELT1", "CDELT2"):
         if k in hdr:
             del hdr[k]
@@ -169,7 +155,7 @@ def build_pose_wcs(ra_b_deg, dec_b_deg, roll_deg, intr_keys, cd_base, cd_base_ro
 
 
 def attitude_from_R(R):
-    """Initial (RA, Dec) extraction from the rough Wahba R; roll is searched."""
+    """Extract (RA, Dec) of the boresight from a body→ICRS rotation."""
     boresight_icrs = R @ np.array([1.0, 0.0, 0.0])
     ra  = float(np.degrees(np.arctan2(boresight_icrs[1], boresight_icrs[0])))
     dec = float(np.degrees(np.arcsin(np.clip(boresight_icrs[2], -1.0, 1.0))))
@@ -179,8 +165,8 @@ def attitude_from_R(R):
 def plate_solve(pixel_xy, ref_radec, intr_keys, cd_base, cd_base_roll, init_pose,
                 bounds_deg=2.0, roll_bounds_deg=20.0):
     """
-    Nonlinear least-squares fit of (RA, Dec, roll) to match SIP-forward-projected
-    catalog stars against observed pixel centroids.
+    Refine (RA, Dec, roll) by minimising pixel-space residuals between
+    observed centroids and catalog stars projected through the SIP forward map.
 
     Returns (ra, dec, roll, cost, residuals_px).
     """
@@ -215,20 +201,17 @@ def project_catalog_via_wcs(wcs, cat_ra, cat_dec, img_w, img_h, pad=64):
 def refine_matches_by_projection(wcs, det_xy, identifier, img_w, img_h,
                                  tol_pix=2.0, fov_cone_cos=None):
     """
-    Project mag<7.5 catalog stars through the candidate WCS, then nearest-
-    neighbour-match against observed centroids. Each detection matches at most
-    one catalog star and vice versa (mutual greedy).
+    Project catalog stars through the candidate WCS, then mutual-greedy
+    nearest-neighbour match against observed centroids inside `tol_pix`.
     """
     cat_vecs = identifier.db.star_vecs
-    # Cull catalog to the FOV cone before world2pix (huge speedup).
     bs_icrs = wcs.wcs.crval
     bs_vec  = radec_to_unit_vec(bs_icrs[0], bs_icrs[1])
-    cos_fov = np.cos(np.radians(8.0))  # 16° cone covers TESS 12° FOV + slack
+    cos_fov = np.cos(np.radians(8.0))   # ~16° cone — comfortably covers TESS FOV
     in_cone = (cat_vecs @ bs_vec) >= cos_fov
     cat_idx = np.where(in_cone)[0]
     if cat_idx.size == 0:
         return {}
-    # Convert cone-selected cat vecs to ra/dec for world2pix
     v = cat_vecs[cat_idx]
     dec = np.degrees(np.arcsin(np.clip(v[:, 2], -1.0, 1.0)))
     ra  = np.degrees(np.arctan2(v[:, 1], v[:, 0])) % 360.0
@@ -237,13 +220,11 @@ def refine_matches_by_projection(wcs, det_xy, identifier, img_w, img_h,
     if cat_idx.size == 0 or len(det_xy) == 0:
         return {}
 
-    # Pairwise distances det × cat
     det_xy = np.asarray(det_xy, dtype=np.float64)
     dx = det_xy[:, 0:1] - px[None, :]
     dy = det_xy[:, 1:2] - py[None, :]
     dist = np.hypot(dx, dy)
 
-    # Mutual greedy: sort all (det, cat) pairs by distance, accept in order
     matches = {}
     used_det = set(); used_cat = set()
     flat = np.argsort(dist, axis=None)
@@ -259,8 +240,7 @@ def refine_matches_by_projection(wcs, det_xy, identifier, img_w, img_h,
 
 
 def _R_from_pose(ra_deg, dec_deg, roll_deg):
-    """Build the body→ICRS rotation matrix from (RA, Dec, roll), matching the
-    convention used by `build_pose_wcs` so that R_pose @ body_camera ≈ ICRS."""
+    """Body→ICRS rotation R = Rz(RA)·Ry(-Dec)·Rx(roll), matching `build_pose_wcs`."""
     ra = np.radians(ra_deg); dec = np.radians(dec_deg); roll = np.radians(roll_deg)
     Rz = np.array([[ np.cos(ra), -np.sin(ra), 0],
                    [ np.sin(ra),  np.cos(ra), 0],
@@ -275,21 +255,17 @@ def _R_from_pose(ra_deg, dec_deg, roll_deg):
 
 
 def boresight_rotation(ra_b_deg, dec_b_deg):
-    """
-    GT rotation body→ICRS consistent with the intrinsics-WCS body frame
-    (boresight body=(1,0,0), body_y=east, body_z=north at the boresight).
-
-    Columns of R are body x, y, z directions expressed in ICRS.
-    """
+    """Body→ICRS rotation with body_y=east, body_z=north (zero roll, sky-aligned)."""
     ra = np.radians(ra_b_deg)
     dec = np.radians(dec_b_deg)
     bx = np.array([np.cos(ra) * np.cos(dec), np.sin(ra) * np.cos(dec), np.sin(dec)])
-    by = np.array([-np.sin(ra), np.cos(ra), 0.0])               # local east
-    bz = np.array([-np.cos(ra) * np.sin(dec), -np.sin(ra) * np.sin(dec), np.cos(dec)])  # local north
+    by = np.array([-np.sin(ra), np.cos(ra), 0.0])
+    bz = np.array([-np.cos(ra) * np.sin(dec), -np.sin(ra) * np.sin(dec), np.cos(dec)])
     return np.stack([bx, by, bz], axis=1)
 
 
 def rot_to_quat(R):
+    """3×3 rotation → unit quaternion [w, x, y, z] (Shepperd's method)."""
     tr = R[0,0]+R[1,1]+R[2,2]
     if tr > 0:
         s = 0.5/np.sqrt(tr+1.0)
@@ -313,13 +289,13 @@ def angular_error_arcsec(q1, q2):
 
 
 # ---------------------------------------------------------------------------
-# Detection + identification + Wahba
+# Detection + RANSAC ID + plate-solve
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def detect_unet(model, img_np, device, threshold=0.55, flux_window=7):
     """
-    Detect stars + estimate brightness via FLUX SUM in a window around centroid.
-    Returns (xy: Nx2, brightness: N).
+    Run the U-Net on every 512×512 non-overlapping tile of the full image.
+    Returns (xy: Nx2 sub-pixel centroids, flux: N — sum within `flux_window`).
     """
     h, w = img_np.shape
     out_xy, out_b = [], []
@@ -332,14 +308,10 @@ def detect_unet(model, img_np, device, threshold=0.55, flux_window=7):
             hm = model(t).cpu().numpy().squeeze()
             for lx, ly in extract_centroids(hm, threshold=threshold):
                 ix, iy = int(round(lx)), int(round(ly))
-                # Flux = sum of pixels in flux_window×flux_window box
-                x1 = max(0, ix - half)
-                x2 = min(TILE_SIZE, ix + half + 1)
-                y1 = max(0, iy - half)
-                y2 = min(TILE_SIZE, iy + half + 1)
-                flux = float(tile[y1:y2, x1:x2].sum())
+                x1 = max(0, ix - half); x2 = min(TILE_SIZE, ix + half + 1)
+                y1 = max(0, iy - half); y2 = min(TILE_SIZE, iy + half + 1)
                 out_xy.append((lx + col, ly + row))
-                out_b.append(flux)
+                out_b.append(float(tile[y1:y2, x1:x2].sum()))
     xy = np.array(out_xy, dtype=np.float32) if out_xy else np.zeros((0, 2))
     bs = np.array(out_b, dtype=np.float32) if out_b else np.zeros((0,))
     return xy, bs
@@ -348,9 +320,11 @@ def detect_unet(model, img_np, device, threshold=0.55, flux_window=7):
 def solve_attitude_full(model, identifier, img_path, lbl_path, device,
                         unet_threshold=0.55, top_n_bright=60, verbose=True,
                         debug_gt=False):
-    """Full pipeline → returns dict with angular_error and intermediates."""
+    """
+    Full lost-in-space pipeline for one image. Returns a dict with the
+    predicted attitude, ground-truth comparison, match table, and timing.
+    """
     img_np = np.array(Image.open(img_path), dtype=np.float32) / 255.0
-    h, w = img_np.shape
     with open(lbl_path) as f:
         label = json.load(f)
 
@@ -359,22 +333,19 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         return {"failed": True, "reason": "label_missing_wcs", "n_det": 0}
 
     ps_arcsec = pose["plate_scale_arcsec_per_pix"]
-    ps_deg    = ps_arcsec / 3600.0
-    ps_rad    = np.radians(ps_deg)
+    ps_rad    = np.radians(ps_arcsec / 3600.0)
     wcs_full  = load_intrinsics_wcs(pose["wcs_header"])
     intr_keys, cd_base, cd_base_roll = extract_camera_intrinsics(pose["wcs_header"])
 
-    # GT pose is in CRVAL parametrisation (sky at CRPIX), NOT boresight_ra/dec
-    # (sky at image centre). The two differ by ~0.1° on TESS because CRPIX is
-    # not at the image centre. Plate-solve fits the CRVAL parameters, so we
-    # compare against them directly.
-    ra_gt   = float(pose["wcs_header"]["CRVAL1"])
-    dec_gt  = float(pose["wcs_header"]["CRVAL2"])
-    roll_gt = cd_base_roll
+    # GT attitude uses CRVAL (sky at CRPIX), which differs from `boresight_ra_deg`
+    # (sky at image centre) by ~0.1″ on TESS. Plate-solve fits CRVAL, compare against it.
+    ra_gt, dec_gt, roll_gt = (float(pose["wcs_header"]["CRVAL1"]),
+                              float(pose["wcs_header"]["CRVAL2"]),
+                              cd_base_roll)
     R_gt = _R_from_pose(ra_gt, dec_gt, roll_gt)
     q_gt = rot_to_quat(R_gt); q_gt /= np.linalg.norm(q_gt)
 
-    # 1. Detect + brightness (flux sum)
+    # --- Stage 1: U-Net detection ------------------------------------------
     t0 = time.time()
     det_xy_all, det_bright = detect_unet(model, img_np, device, unet_threshold)
     t_detect = time.time() - t0
@@ -382,48 +353,38 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     if len(det_xy_all) < 10:
         return {"failed": True, "reason": "too_few_detections", "n_det": len(det_xy_all)}
 
-    # 2. Sort by flux (brightness), keep top N
+    # --- Stage 2: body vectors (SIP-corrected) -----------------------------
     bright_order = np.argsort(-det_bright)
     det_xy = det_xy_all[bright_order[:top_n_bright]]
-
-    # 3. Body vectors — top-N for triangle search, ALL for verification.
-    #    SIP-corrected (TESS has strong barrel distortion; a linear pinhole
-    #    projection gives 200-500" errors at the corners).
     body_vecs     = pixels_to_body_vecs(np.asarray(det_xy),     wcs_full, ps_rad)
     body_vecs_all = pixels_to_body_vecs(np.asarray(det_xy_all), wcs_full, ps_rad)
 
-    # 4. RANSAC Star ID with PYRAMID-STYLE verification on ALL detections
+    # --- Stage 3: RANSAC triangle ID + Wahba SVD ---------------------------
     t1 = time.time()
-    id_result = identifier.identify(
-        body_vecs,
-        verify_body_vecs=body_vecs_all,   # ← strict verification on all 477
-        verbose=verbose,
-    )
+    id_result = identifier.identify(body_vecs,
+                                    verify_body_vecs=body_vecs_all,
+                                    verbose=verbose)
     t_identify = time.time() - t1
 
     if id_result is None:
         return {"failed": True, "reason": "id_failed",
                 "n_det": len(det_xy_all), "n_top": len(det_xy)}
 
-    # 5. FINAL REFINEMENT on ALL detections with TIGHT tolerance.
-    #    Capped at 2 iterations + drift gate: refinement must not rotate R
-    #    more than 0.5° from the Star-ID result, or it is leaking into a
-    #    different self-consistent constellation (root cause of past 1e5"
-    #    "solved" failures).
-    R_id   = id_result.R
-    R      = R_id
+    # --- Stage 4: refine R against all detections, capped by drift gate ----
+    # Tolerance is sized to the SIP-corrected body-vec residual at the edges (~200″).
+    # The drift gate prevents the refit from sliding off to a different self-
+    # consistent constellation when the initial set of matches contains outliers.
+    R_id     = id_result.R
+    R        = R_id
     body_all = body_vecs_all
-    # Sized to SIP-corrected body-vec residual budget (~200" worst case at edges).
-    verify_tol_rad = np.radians(200.0 / 3600.0)
+    verify_tol_rad      = np.radians(200.0 / 3600.0)
     MAX_FINAL_DRIFT_DEG = 2
 
     for _ in range(2):
-        # Project all detections through current R
         body_in_icrs = body_all @ R.T
         dots = body_in_icrs @ identifier.db.star_vecs.T
         cos_tol = np.cos(verify_tol_rad)
 
-        # Greedy matching: best score first
         best_cat = np.argmax(dots, axis=1)
         best_score = dots[np.arange(len(body_all)), best_cat]
         order = np.argsort(-best_score)
@@ -438,33 +399,28 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         if len(all_matches) < 4:
             break
 
-        # Refit R with all current matches
-        body_pairs = [body_all[di]              for di in all_matches.keys()]
+        body_pairs = [body_all[di]               for di in all_matches.keys()]
         ref_pairs  = [identifier.db.star_vecs[ci] for ci in all_matches.values()]
         B = sum(np.outer(r, b) for b, r in zip(body_pairs, ref_pairs))
-        U, S, Vt = np.linalg.svd(B)
+        U, _, Vt = np.linalg.svd(B)
         ds = np.linalg.det(U) * np.linalg.det(Vt)
         R_new = U @ np.diag([1.0, 1.0, ds]) @ Vt
 
-        # Drift gate against R_id (NOT the previous step!)
         trace_rel = np.trace(R_id.T @ R_new)
         drift_deg = np.degrees(np.arccos(np.clip((trace_rel - 1) / 2, -1, 1)))
         if drift_deg > MAX_FINAL_DRIFT_DEG:
-            break  # discard R_new — keep last good R
+            break
 
         if np.allclose(R, R_new, atol=1e-9):
             R = R_new
             break
         R = R_new
 
-    # ----- PASS 2 + PASS 3 : iterative WCS refinement + plate-solve ---------
-    # Pass 1's R_rough is good to ~0.5°; below we synthesise a candidate WCS at
-    # each iteration, snap detections to projected catalog stars within a tight
-    # pixel tolerance, and re-fit (RA, Dec, roll) by SIP-aware plate-solve. The
-    # loop converges in 2-3 iterations when Pass 1's R was within ~1°.
-
+    # --- Stage 5: WCS projection refinement + plate-solve ------------------
+    # Synthesise a candidate WCS from the rough R, project the catalog through
+    # it, snap detections at tightening pixel tolerance, and re-fit (RA, Dec, roll)
+    # via SIP-aware nonlinear least-squares. Converges in 2-3 iterations.
     img_h, img_w = label["image_shape"]
-    # Convert Pass 1 matches → (pixel_xy, ref_radec) for the first plate-solve.
     cat_vecs = identifier.db.star_vecs
 
     def _matches_to_pairs(matches, det_xy_arr):
@@ -477,20 +433,15 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         ra  = np.degrees(np.arctan2(v[:, 1], v[:, 0])) % 360.0
         return det_xy_arr[di], np.stack([ra, dec], axis=-1)
 
-    # Initial (RA, Dec) = direction at CRPIX, not at image centre. We get this
-    # by mapping CRPIX→body via the intrinsics WCS, then R_rough@that = ICRS at
-    # CRPIX. Roll starts at the CD-base value (a multi-start sweep would
-    # generalise to genuine lost-in-space without any stored WCS).
+    # Seed pose at CRPIX (not image centre — CRPIX is the SIP reference pixel).
     crpix = np.array([[float(pose["wcs_header"]["CRPIX1"]),
                        float(pose["wcs_header"]["CRPIX2"])]])
     body_crpix = pixels_to_body_vecs(crpix, wcs_full, ps_rad)[0]
     icrs_crpix = R @ body_crpix
     ra_init  = float(np.degrees(np.arctan2(icrs_crpix[1], icrs_crpix[0]))) % 360.0
     dec_init = float(np.degrees(np.arcsin(np.clip(icrs_crpix[2], -1, 1))))
-    roll_init = cd_base_roll
-    init_pose = (ra_init, dec_init, roll_init)
+    init_pose = (ra_init, dec_init, cd_base_roll)
 
-    # First plate-solve from Pass 1 matches.
     pix_in, rdc_in = _matches_to_pairs(all_matches, det_xy_all)
     final_res = None
     if len(pix_in) < 4:
@@ -502,9 +453,6 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
             pix_in, rdc_in, intr_keys, cd_base, cd_base_roll, init_pose)
         pose_pred = (ra, dec, roll)
 
-        # Pass 2: project full catalog through the refined WCS, snap to detections
-        # at progressively tighter pixel tolerance. First plate-solve from Pass 1
-        # is good to ~30 px; we tighten to ~1 px over 3 iterations.
         for tol_pix in (30.0, 5.0, 1.5):
             w_cand = build_pose_wcs(*pose_pred, intr_keys, cd_base, cd_base_roll)
             new_matches = refine_matches_by_projection(
@@ -519,10 +467,10 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
             all_matches = new_matches
         pass3_matches = all_matches
 
-    # Quality gate: after plate-solve, the median |pixel residual| of accepted
-    # matches should be sub-pixel for a clean lock. cam3/ccd2-style false locks
-    # appear with residuals ~5-50 px because the optimiser converged on a
-    # self-consistent but wrong constellation. Reject those.
+    # --- Stage 6: quality gate ---------------------------------------------
+    # A clean attitude lock has sub-pixel post-fit residual. Larger residuals
+    # mean the optimiser settled on a self-consistent but wrong constellation;
+    # refuse the answer rather than report a silent garbage attitude.
     if final_res is None or len(final_res) < 8:
         median_px_res = float("nan")
         quality_ok = False
@@ -537,18 +485,15 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     q_pred = rot_to_quat(R_pred); q_pred /= np.linalg.norm(q_pred)
     err = angular_error_arcsec(q_pred, q_gt)
 
-    # Artefacts needed to reconstruct the visualisation without re-running
-    # the slow RANSAC + plate-solve.
     matched_pairs = []
     for di, ci in pass3_matches.items():
-        px_obs = float(det_xy_all[di, 0]); py_obs = float(det_xy_all[di, 1])
         cv = identifier.db.star_vecs[ci]
-        ra_c  = float(np.degrees(np.arctan2(cv[1], cv[0]))) % 360.0
-        dec_c = float(np.degrees(np.arcsin(np.clip(cv[2], -1, 1))))
         matched_pairs.append({
             "det_idx": int(di), "cat_idx": int(ci),
-            "px": px_obs, "py": py_obs,
-            "ra_deg": ra_c, "dec_deg": dec_c,
+            "px": float(det_xy_all[di, 0]),
+            "py": float(det_xy_all[di, 1]),
+            "ra_deg":  float(np.degrees(np.arctan2(cv[1], cv[0]))) % 360.0,
+            "dec_deg": float(np.degrees(np.arcsin(np.clip(cv[2], -1, 1)))),
             "hipparcos_id": int(identifier.db.star_ids[ci]),
         })
 
@@ -568,50 +513,56 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         "n_matched_id":   len(id_result.matches),
         "n_matched":      len(pass3_matches),
         "iterations":     id_result.iterations,
-        "triangle":       list(id_result.triangle),   # (det_i, det_j, det_k, cat_i, cat_j, cat_k)
-        "det_xy_top":     det_xy.tolist(),            # top-N brightest used for triangle search
+        "triangle":       list(id_result.triangle),
+        "det_xy_top":     det_xy.tolist(),
         "angular_error_arcsec": err,
-        "pixel_error": err / ps_arcsec,
-        "plate_solve_cost": cost,
-        "median_px_residual": median_px_res,
-        "time_detect_s":   t_detect,
-        "time_identify_s": t_identify,
-        "pose_pred": pose_pred,
-        "pose_gt":   (ra_gt, dec_gt, roll_gt),
-        "q_pred": q_pred,
-        "q_gt":   q_gt,
-        "det_xy": det_xy_all.tolist(),
-        "matched_pairs": matched_pairs,
+        "pixel_error":          err / ps_arcsec,
+        "plate_solve_cost":     cost,
+        "median_px_residual":   median_px_res,
+        "time_detect_s":        t_detect,
+        "time_identify_s":      t_identify,
+        "pose_pred":            pose_pred,
+        "pose_gt":              (ra_gt, dec_gt, roll_gt),
+        "q_pred":               q_pred,
+        "q_gt":                 q_gt,
+        "det_xy":               det_xy_all.tolist(),
+        "matched_pairs":        matched_pairs,
     }
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", required=True)
-    ap.add_argument("--model",    required=True)
-    ap.add_argument("--catalog",  required=True)
-    ap.add_argument("--threshold", type=float, default=0.55)
-    ap.add_argument("--mag-limit", type=float, default=6.0)
-    ap.add_argument("--n-images",  type=int, default=0, help="0=all")
-    ap.add_argument("--debug",     action="store_true", help="Print per-iteration progress")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-dir", required=True,
+                    help="Dataset directory containing images/ and labels/.")
+    ap.add_argument("--model",    required=True,
+                    help="Path to the trained U-Net checkpoint (best_model.pt).")
+    ap.add_argument("--catalog",  required=True,
+                    help="Hipparcos catalog CSV (hipparcos_id, ra_deg, dec_deg, mag).")
+    ap.add_argument("--threshold", type=float, default=0.55,
+                    help="U-Net heatmap detection threshold (default 0.55).")
+    ap.add_argument("--mag-limit", type=float, default=6.0,
+                    help="Magnitude cutoff for catalog stars (default 6.0).")
+    ap.add_argument("--n-images",  type=int, default=0,
+                    help="Stop after this many images (0 = all).")
+    ap.add_argument("--debug",     action="store_true",
+                    help="Print per-iteration RANSAC progress.")
     ap.add_argument("--out-dir",   default=None,
-                    help="If given, write per-image JSON with detections+matches+pose "
-                         "to <out-dir>/<image_stem>.json for visualisation.")
+                    help="If set, write per-image JSON artefacts here for "
+                         "downstream visualisation.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
-    # Load U-Net
     model = UNet(base_ch=32).to(device)
     model.load_state_dict(torch.load(args.model, map_location=device))
     model.eval()
-    print(f"U-Net loaded from {args.model}")
+    print(f"Model loaded from {args.model}")
 
-    # Build pattern DB (cached after first run)
     identifier = StarIdentifier(args.catalog, mag_limit=args.mag_limit)
     print(f"Pattern DB ready: {len(identifier.db.star_ids):,} stars, "
           f"{len(identifier.db.pair_angles):,} pairs\n")
@@ -661,19 +612,18 @@ def main():
             with open(out_dir / f"{img_path.stem}.json", "w") as f:
                 json.dump(artefact, f)
 
-    # Summary
-    errors = [r["angular_error_arcsec"] for r in results if not r["failed"]]
+    errors  = [r["angular_error_arcsec"] for r in results if not r["failed"]]
     n_total = len(results)
-    n_ok = len(errors)
+    n_ok    = len(errors)
     print(f"\n{'='*70}")
-    print(f"REAL PIPELINE (lost-in-space, no --use-gt):")
-    print(f"  Solved        : {n_ok}/{n_total}  ({100*n_ok/max(n_total,1):.1f}%)")
+    print(f"Lost-in-space pipeline summary:")
+    print(f"  Solved       : {n_ok}/{n_total}  ({100 * n_ok / max(n_total, 1):.1f}%)")
     if errors:
         e = np.array(errors)
-        print(f"  Median error  : {np.median(e):.2f}\"")
-        print(f"  Mean error    : {np.mean(e):.2f}\"")
-        print(f"  90th pct      : {np.percentile(e, 90):.2f}\"")
-        print(f"  Max error     : {np.max(e):.2f}\"")
+        print(f"  Median error : {np.median(e):.2f}\"")
+        print(f"  Mean error   : {np.mean(e):.2f}\"")
+        print(f"  90th pct     : {np.percentile(e, 90):.2f}\"")
+        print(f"  Max error    : {np.max(e):.2f}\"")
     print(f"{'='*70}")
 
 

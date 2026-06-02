@@ -197,9 +197,6 @@ ps_rad        = np.radians(ps_arcsec / 3600.0)
 wcs_full      = load_intrinsics_wcs(pose["wcs_header"])
 intr_keys, cd_base, cd_base_roll = extract_camera_intrinsics(pose["wcs_header"])
 
-# Sticky placeholder for the running image (we keep updating it)
-running_panel = st.empty()
-
 # ============================ STAGE 1 ===================================
 st.markdown("## Stage 1 — U-Net detection")
 st.markdown(
@@ -214,7 +211,6 @@ with st.status("🔁 Running U-Net on 16 tiles...", expanded=True) as s1:
     st.write(f"**{len(det_xy)} centroids** found in {t_detect:.1f}s "
               f"(threshold={unet_thr:.2f})")
 
-    # Visualisation: image + detections
     fig, ax = plt.subplots(figsize=(9, 9))
     show_image_with_overlay(ax, img_np, vmin, vmax,
         f"Stage 1: {len(det_xy)} detections from U-Net")
@@ -223,8 +219,7 @@ with st.status("🔁 Running U-Net on 16 tiles...", expanded=True) as s1:
     ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
     st.pyplot(fig, use_container_width=True)
 
-    # Side panel: heatmap of one tile
-    st.markdown("**What the U-Net actually outputs** (one centre tile, raw heatmap):")
+    st.markdown("**What the U-Net actually outputs** (centre tile, raw heatmap):")
     row0 = (img_h - TILE_SIZE) // 2
     col0 = (img_w - TILE_SIZE) // 2
     tile = img_np[row0:row0+TILE_SIZE, col0:col0+TILE_SIZE]
@@ -281,17 +276,23 @@ with st.status("🔁 Computing body vectors...", expanded=True) as s2:
     ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
     st.pyplot(fig, use_container_width=True)
 
-    # Show a few body vectors as a table
+    st.markdown(
+        "Each row below is one detected star shown in **two coordinate systems**: "
+        "its 2-D pixel position in the image, and its 3-D unit vector in the "
+        "camera body frame (after SIP correction). The 3-D form is what the "
+        "star-ID algorithm consumes."
+    )
     sample = []
     for i in range(min(5, len(body_vecs))):
         sample.append({
-            "i":  int(top_idx[i]),
-            "pixel x": f"{det_xy_top[i, 0]:.1f}",
-            "pixel y": f"{det_xy_top[i, 1]:.1f}",
-            "body_x": f"{body_vecs[i, 0]:.5f}",
-            "body_y": f"{body_vecs[i, 1]:.5f}",
-            "body_z": f"{body_vecs[i, 2]:.5f}",
-            "flux": f"{det_b[top_idx[i]]:.1f}",
+            "★ brightness rank": i + 1,
+            "detection id":      int(top_idx[i]),
+            "pixel x":  f"{det_xy_top[i, 0]:.1f}",
+            "pixel y":  f"{det_xy_top[i, 1]:.1f}",
+            "body x":   f"{body_vecs[i, 0]:.5f}",
+            "body y":   f"{body_vecs[i, 1]:.5f}",
+            "body z":   f"{body_vecs[i, 2]:.5f}",
+            "flux":     f"{det_b[top_idx[i]]:.1f}",
         })
     st.dataframe(pd.DataFrame(sample), use_container_width=True, hide_index=True)
     s2.update(label="✅ Stage 2 — 60 body vectors ready", state="complete")
@@ -350,7 +351,6 @@ with st.status("🔁 RANSAC searching for a valid triangle "
     })
     st.dataframe(angle_table, use_container_width=True, hide_index=True)
 
-    # Visualise triangle on image
     tri_pix = det_xy_top[[di, dj, dk]]
     fig, ax = plt.subplots(figsize=(9, 9))
     show_image_with_overlay(ax, img_np, vmin, vmax,
@@ -385,12 +385,12 @@ with st.status("🔁 Solving Wahba SVD on 3 pairs + verifying...", expanded=True
     st.code(np.array2string(R_id, formatter={'float': lambda x: f"{x:+.5f}"},
                               prefix="R = "), language="text")
 
-    # Decompose to (RA, Dec, roll) for human readability
     boresight = R_id @ np.array([1.0, 0, 0])
     ra_est  = np.degrees(np.arctan2(boresight[1], boresight[0])) % 360.0
     dec_est = np.degrees(np.arcsin(np.clip(boresight[2], -1, 1)))
     st.write(f"**Decoded approximate boresight**: RA ≈ {ra_est:.3f}°, Dec ≈ {dec_est:.3f}°")
-    st.write(f"**Verified on full 478 detections**: **{id_result.score} matches** within {VERIFY_TOL_ARCSEC:.0f}″ tolerance")
+    st.write(f"**Verified on all {len(body_vecs_all)} detections**: "
+              f"**{id_result.score} matches** within {VERIFY_TOL_ARCSEC:.0f}″ tolerance")
 
     s4.update(label=f"✅ Stage 4 — rough R found ({id_result.score} initial matches)", state="complete")
 
@@ -405,7 +405,6 @@ st.markdown(
 )
 
 with st.status("🔁 Plate-solve refinement (3 inner iterations)...", expanded=True) as s5:
-    # Helper to convert matches dict → (px_obs, ref_radec)
     def matches_to_pairs(matches):
         di_list = list(matches.keys()); ci_list = list(matches.values())
         v = identifier.db.star_vecs[ci_list]
@@ -413,7 +412,7 @@ with st.status("🔁 Plate-solve refinement (3 inner iterations)...", expanded=T
         ra  = np.degrees(np.arctan2(v[:, 1], v[:, 0])) % 360
         return np.asarray(det_xy)[di_list], np.stack([ra, dec], axis=-1)
 
-    # Final-refinement on Pass-1 matches (Wahba) so we have a clean starting set
+    # Final Wahba refit on the Pass-1 matches so plate-solve starts from a clean R.
     R = R_id
     verify_tol_rad = np.radians(VERIFY_TOL_ARCSEC / 3600.0)
     all_matches = id_result.matches
@@ -438,7 +437,7 @@ with st.status("🔁 Plate-solve refinement (3 inner iterations)...", expanded=T
         ds = np.linalg.det(U) * np.linalg.det(Vt)
         R = U @ np.diag([1., 1., ds]) @ Vt
 
-    # Initial pose: CRPIX direction through R
+    # Seed the plate-solver at the direction R sends CRPIX (not the image centre).
     crpix = np.array([[float(pose["wcs_header"]["CRPIX1"]),
                        float(pose["wcs_header"]["CRPIX2"])]])
     body_crpix = pixels_to_body_vecs(crpix, wcs_full, ps_rad)[0]
@@ -457,7 +456,8 @@ with st.status("🔁 Plate-solve refinement (3 inner iterations)...", expanded=T
                         "median_res_px": f"{float(np.median(np.abs(final_res))):.3f}",
                         "RA": f"{ra:.4f}", "Dec": f"{dec:.4f}", "roll": f"{roll:.4f}"})
 
-        # Pass 2/3 inner loop: project catalog through refined WCS, snap matches, re-solve
+        # Inner loop: project catalog through current WCS, snap matches at
+        # tightening pixel tolerance, re-solve.
         for tol_pix in (30.0, 5.0, 1.5):
             w_cand = build_pose_wcs(*pose_pred, intr_keys, cd_base, cd_base_roll)
             new_matches = refine_matches_by_projection(

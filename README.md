@@ -106,7 +106,7 @@ catalog correspondences.
 ### Interactive Streamlit walkthrough
 
 ```bash
-git clone https://github.com/<your-username>/star-tracker.git
+git clone https://github.com/SpaceDevEngineer/star-tracker.git
 cd star-tracker
 pip install -r requirements.txt
 streamlit run Code/Streamlit_app/pipeline_app.py
@@ -213,7 +213,7 @@ team for the reference star positions used in catalog matching.
 ## Author
 
 Master's thesis project, 2025–2026.
-[Email](mailto:timka02qochqorov@gmail.com) · [LinkedIn](https://linkedin.com/in/your-handle)
+[Email](mailto:timka02qochqorov@gmail.com) · [LinkedIn](https://www.linkedin.com/in/temurkuchkorov/)
 
 ## License
 

@@ -419,14 +419,6 @@ with st.status(
     θ_jk = np.degrees(np.arccos(np.clip(np.dot(bj, bk), -1, 1))) * 3600
 
     if is_replay:
-        Θ_ij = Θ_ik = Θ_jk = None
-    else:
-        vi, vj, vk = identifier.db.star_vecs[ci], identifier.db.star_vecs[cj], identifier.db.star_vecs[ck]
-        Θ_ij = np.degrees(np.arccos(np.clip(np.dot(vi, vj), -1, 1))) * 3600
-        Θ_ik = np.degrees(np.arccos(np.clip(np.dot(vi, vk), -1, 1))) * 3600
-    Θ_jk = np.degrees(np.arccos(np.clip(np.dot(vj, vk), -1, 1))) * 3600
-
-    if is_replay:
         st.markdown("**Pairwise angles** — body-frame triangle from cached centroids:")
         angle_table = pd.DataFrame({
             "pair":          ["A–B", "A–C", "B–C"],
@@ -436,6 +428,11 @@ with st.status(
         st.caption("Live mode also shows the catalog-side angles and their delta; "
                    "Replay omits them to avoid loading the 82 MB pattern DB.")
     else:
+        vi, vj, vk = (identifier.db.star_vecs[ci],
+                      identifier.db.star_vecs[cj],
+                      identifier.db.star_vecs[ck])
+        Θ_ij = np.degrees(np.arccos(np.clip(np.dot(vi, vj), -1, 1))) * 3600
+        Θ_ik = np.degrees(np.arccos(np.clip(np.dot(vi, vk), -1, 1))) * 3600
         Θ_jk = np.degrees(np.arccos(np.clip(np.dot(vj, vk), -1, 1))) * 3600
         st.markdown("**Pairwise angles** — detection triangle vs catalog triangle:")
         angle_table = pd.DataFrame({

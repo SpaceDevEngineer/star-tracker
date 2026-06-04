@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore", module="astropy")
 from triangle_id import StarIdentifier
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "Model_train_code"))
-from train import UNet, extract_centroids
+from train import UNet, extract_centroids, split_pairs
 
 TILE_SIZE = 512
 
@@ -548,6 +548,12 @@ def main():
                     help="Magnitude cutoff for catalog stars (default 6.0).")
     ap.add_argument("--n-images",  type=int, default=0,
                     help="Stop after this many images (0 = all).")
+    ap.add_argument("--split",     choices=("all", "train", "val", "test"),
+                    default="all",
+                    help="Restrict to a deterministic split (uses split_pairs "
+                         "from the U-Net training code, seed=42, by image to "
+                         "avoid tile-level leakage). 'all' (default) scans "
+                         "every PNG in images/.")
     ap.add_argument("--debug",     action="store_true",
                     help="Print per-iteration RANSAC progress.")
     ap.add_argument("--out-dir",   default=None,
@@ -569,7 +575,19 @@ def main():
 
     # Iterate test images
     data_dir = Path(args.data_dir)
-    img_files = sorted((data_dir / "images").glob("*.png"))
+    if args.split == "all":
+        img_files = sorted((data_dir / "images").glob("*.png"))
+        pair_index = {p: data_dir / "labels" / (p.stem + ".json") for p in img_files}
+    else:
+        train_pairs, val_pairs, test_pairs = split_pairs(str(data_dir))
+        split_map = {"train": train_pairs, "val": val_pairs, "test": test_pairs}
+        chosen = split_map[args.split]
+        img_files  = [img for img, _ in chosen]
+        pair_index = {img: lbl for img, lbl in chosen}
+        print(f"Using split='{args.split}' "
+              f"({len(train_pairs)}/{len(val_pairs)}/{len(test_pairs)} "
+              f"train/val/test by image, seed=42)")
+
     if args.n_images > 0:
         img_files = img_files[:args.n_images]
     print(f"Testing on {len(img_files)} images\n")
@@ -583,7 +601,7 @@ def main():
 
     results = []
     for img_path in img_files:
-        lbl_path = data_dir / "labels" / (img_path.stem + ".json")
+        lbl_path = pair_index[img_path]
         if not lbl_path.exists():
             continue
 

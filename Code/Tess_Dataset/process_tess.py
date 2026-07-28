@@ -13,17 +13,16 @@ Pipeline per FITS file:
 
 Usage:
     python process_tess.py \
-        --fits-dir /Users/timon/Desktop/Thesis/Data/Image_TESS/cam1-ccd1 \
-        --catalog  /Users/timon/Desktop/Thesis/Data/hybrid/catalog_hipparcos.csv \
-        --out-dir  /Users/timon/Desktop/Thesis/Code/dataset \
+        --fits-dir Data/raw_tess \
+        --catalog  Data/hybrid/catalog_hipparcos_full.csv \
+        --out-dir  Data/dataset_tess \
         --wcs-source header
 
     # Or with Astrometry.net (requires ASTROMETRY_API_KEY env var or --api-key):
     python process_tess.py --wcs-source astrometry --api-key XXXXXXXXXXXX ...
 
 Notes:
-    - The provided Hipparcos CSV has columns (ra_deg, dec_deg, mag) but no HIP identifier,
-      so the 0-based CSV row index is used as `hipparcos_id` (deterministic within this catalog).
+    - The bundled Hipparcos CSV includes hipparcos_id, ra_deg, dec_deg, and mag.
 """
 
 from __future__ import annotations
@@ -522,17 +521,17 @@ def process_one(
 # ---------------------------------------------------------------------------
 def main() -> int:
     p = argparse.ArgumentParser(description="TESS FFI → Star Tracker dataset pipeline")
-    p.add_argument("--fits-dir", type=Path,
-                   default=Path("/Users/timon/Desktop/Thesis/Data/Image_TESS_demo"))
+    p.add_argument("--fits-dir", type=Path, required=True,
+                   help="Directory containing source TESS FITS files.")
     p.add_argument("--catalog",  type=Path,
-                   default=Path("/Users/timon/Desktop/Thesis/Data/hybrid/catalog_hipparcos_full.csv"),
+                   default=Path("Data/hybrid/catalog_hipparcos_full.csv"),
                    help="Hipparcos CSV; must have ra_deg, dec_deg, mag (and ideally hipparcos_id).")
     p.add_argument("--ids-csv", type=Path, default=None,
                    help="Optional companion CSV aligned row-by-row with --catalog, "
                         "contributing a 'hipparcos_id' column. Only needed for legacy "
                         "split catalogs (new catalog_hipparcos_full.csv already has IDs).")
     p.add_argument("--out-dir",  type=Path,
-                   default=Path("/Users/timon/Desktop/Thesis/Code/dataset"))
+                   default=Path("Data/dataset_tess"))
     p.add_argument("--wcs-source", choices=("header", "astrometry"), default="header",
                    help="'header' uses WCS from FITS (fast, works for TESS). "
                         "'astrometry' uploads PNG to Astrometry.net.")

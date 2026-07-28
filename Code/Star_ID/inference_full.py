@@ -100,14 +100,21 @@ def _gt_R_from_label(label, wcs_full, ps_rad, identifier):
 # ---------------------------------------------------------------------------
 def extract_camera_intrinsics(wcs_dict):
     """
-    Separate camera intrinsics (SIP, CRPIX, CD shear) from attitude (CRVAL,
-    overall rotation). CD is treated as an intrinsic because the per-CCD
-    plate-scale anisotropy and shear are factory-calibrated camera properties.
+    Separate camera intrinsics (SIP, CRPIX, CD scale/shear) from attitude
+    (CRVAL and the rotational part of CD).
+
+    The raw FITS CD matrix mixes two physically different quantities:
+      * a frame-dependent image rotation (attitude), and
+      * a camera-dependent scale/shear calibration (intrinsic).
+
+    We factor the rotation out before returning ``cd_intrinsic``. This prevents
+    the plate solver from receiving the ground-truth roll through the label WCS.
 
     Returns:
         intr_keys : header fields copied verbatim into every synthesized WCS
-        cd_base   : (2, 2) reference CD matrix
-        cd_roll   : roll angle (deg) baked into cd_base
+        cd_intrinsic : (2, 2) attitude-free CD scale/shear matrix
+        physical_roll : frame roll about body +x (deg), retained only for
+                        ground-truth scoring
     """
     keep_exact = {"CTYPE1", "CTYPE2", "CUNIT1", "CUNIT2", "RADESYS", "EQUINOX",
                   "WCSAXES", "CRPIX1", "CRPIX2"}
@@ -124,21 +131,28 @@ def extract_camera_intrinsics(wcs_dict):
                       dtype=np.float64)
         cdelt = np.diag([wcs_dict.get("CDELT1", 1.0), wcs_dict.get("CDELT2", 1.0)])
         cd = pc @ cdelt
-    cd_roll = float(np.degrees(np.arctan2(cd[0, 1], cd[0, 0])))
-    return intr_keys, cd, cd_roll
+    cd_angle = float(np.degrees(np.arctan2(cd[0, 1], cd[0, 0])))
+    a = np.radians(-cd_angle)
+    unrotate = np.array([[np.cos(a), -np.sin(a)],
+                         [np.sin(a),  np.cos(a)]])
+    cd_intrinsic = unrotate @ cd
+    # Camera convention: increasing pixel x points along -body-y. Therefore a
+    # zero physical body roll corresponds to a 180° CD angle.
+    physical_roll = (180.0 - cd_angle) % 360.0
+    return intr_keys, cd_intrinsic, physical_roll
 
 
-def build_pose_wcs(ra_b_deg, dec_b_deg, roll_deg, intr_keys, cd_base, cd_base_roll):
+def build_pose_wcs(ra_b_deg, dec_b_deg, roll_deg, intr_keys, cd_intrinsic):
     """Construct an astropy WCS for a candidate attitude + camera intrinsics.
 
-    The CD matrix preserves the camera's per-CCD shear (cd_base) and just
-    *rotates* it by (roll - cd_base_roll). When roll == cd_base_roll this
-    reproduces the labels' WCS exactly.
+    ``cd_intrinsic`` contains only the per-CCD scale/shear calibration. The
+    candidate roll is applied explicitly, so no frame attitude is inherited
+    from the ground-truth WCS.
     """
-    drot = np.radians(roll_deg - cd_base_roll)
-    c, s = np.cos(drot), np.sin(drot)
+    cd_angle = np.radians(180.0 - roll_deg)
+    c, s = np.cos(cd_angle), np.sin(cd_angle)
     R2 = np.array([[c, -s], [s, c]])
-    cd = R2 @ cd_base
+    cd = R2 @ cd_intrinsic
 
     hdr = fits.Header()
     for k, v in intr_keys.items():
@@ -162,7 +176,7 @@ def attitude_from_R(R):
     return ra % 360.0, dec
 
 
-def plate_solve(pixel_xy, ref_radec, intr_keys, cd_base, cd_base_roll, init_pose,
+def plate_solve(pixel_xy, ref_radec, intr_keys, cd_intrinsic, init_pose,
                 bounds_deg=2.0, roll_bounds_deg=20.0):
     """
     Refine (RA, Dec, roll) by minimising pixel-space residuals between
@@ -175,7 +189,7 @@ def plate_solve(pixel_xy, ref_radec, intr_keys, cd_base, cd_base_roll, init_pose
 
     def residuals(params):
         ra, dec, roll = params
-        w = build_pose_wcs(ra, dec, roll, intr_keys, cd_base, cd_base_roll)
+        w = build_pose_wcs(ra, dec, roll, intr_keys, cd_intrinsic)
         px, py = w.all_world2pix(ref_radec[:, 0], ref_radec[:, 1], 0)
         return np.concatenate([np.asarray(px) - pixel_xy[:, 0],
                                np.asarray(py) - pixel_xy[:, 1]])
@@ -252,6 +266,32 @@ def _R_from_pose(ra_deg, dec_deg, roll_deg):
                    [0, np.cos(roll), -np.sin(roll)],
                    [0, np.sin(roll),  np.cos(roll)]])
     return Rz @ Ry @ Rx
+
+
+def pose_from_R(R):
+    """Recover (RA, Dec, roll) from a body→ICRS rotation matrix.
+
+    This is the inverse of :func:`_R_from_pose` away from the usual Euler-angle
+    singularity at |Dec|=90°. TESS pointings are comfortably away from it.
+    """
+    R = np.asarray(R, dtype=np.float64)
+    boresight = R[:, 0]
+    ra = float(np.degrees(np.arctan2(boresight[1], boresight[0]))) % 360.0
+    dec = float(np.degrees(np.arcsin(np.clip(boresight[2], -1.0, 1.0))))
+
+    R_zero_roll = _R_from_pose(ra, dec, 0.0)
+    R_roll = R_zero_roll.T @ R
+    roll = float(np.degrees(np.arctan2(R_roll[2, 1], R_roll[1, 1]))) % 360.0
+    return ra, dec, roll
+
+
+def pixel_residual_norms(final_res):
+    """Convert least-squares [dx..., dy...] output to per-star radial pixels."""
+    final_res = np.asarray(final_res, dtype=np.float64)
+    if final_res.size == 0 or final_res.size % 2:
+        return np.zeros(0, dtype=np.float64)
+    n = final_res.size // 2
+    return np.hypot(final_res[:n], final_res[n:])
 
 
 def boresight_rotation(ra_b_deg, dec_b_deg):
@@ -335,13 +375,14 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     ps_arcsec = pose["plate_scale_arcsec_per_pix"]
     ps_rad    = np.radians(ps_arcsec / 3600.0)
     wcs_full  = load_intrinsics_wcs(pose["wcs_header"])
-    intr_keys, cd_base, cd_base_roll = extract_camera_intrinsics(pose["wcs_header"])
+    intr_keys, cd_intrinsic, physical_roll_gt = extract_camera_intrinsics(
+        pose["wcs_header"])
 
     # GT attitude uses CRVAL (sky at CRPIX), which differs from `boresight_ra_deg`
     # (sky at image centre) by ~0.1″ on TESS. Plate-solve fits CRVAL, compare against it.
     ra_gt, dec_gt, roll_gt = (float(pose["wcs_header"]["CRVAL1"]),
                               float(pose["wcs_header"]["CRVAL2"]),
-                              cd_base_roll)
+                              physical_roll_gt)
     R_gt = _R_from_pose(ra_gt, dec_gt, roll_gt)
     q_gt = rot_to_quat(R_gt); q_gt /= np.linalg.norm(q_gt)
 
@@ -381,20 +422,7 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     MAX_FINAL_DRIFT_DEG = 2
 
     for _ in range(2):
-        body_in_icrs = body_all @ R.T
-        dots = body_in_icrs @ identifier.db.star_vecs.T
-        cos_tol = np.cos(verify_tol_rad)
-
-        best_cat = np.argmax(dots, axis=1)
-        best_score = dots[np.arange(len(body_all)), best_cat]
-        order = np.argsort(-best_score)
-        all_matches = {}
-        used_cat = set()
-        for di in order:
-            ci = int(best_cat[di])
-            if best_score[di] >= cos_tol and ci not in used_cat:
-                all_matches[int(di)] = ci
-                used_cat.add(ci)
+        all_matches = identifier._verify_full(body_all, R, verify_tol_rad)
 
         if len(all_matches) < 4:
             break
@@ -433,14 +461,9 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         ra  = np.degrees(np.arctan2(v[:, 1], v[:, 0])) % 360.0
         return det_xy_arr[di], np.stack([ra, dec], axis=-1)
 
-    # Seed pose at CRPIX (not image centre — CRPIX is the SIP reference pixel).
-    crpix = np.array([[float(pose["wcs_header"]["CRPIX1"]),
-                       float(pose["wcs_header"]["CRPIX2"])]])
-    body_crpix = pixels_to_body_vecs(crpix, wcs_full, ps_rad)[0]
-    icrs_crpix = R @ body_crpix
-    ra_init  = float(np.degrees(np.arctan2(icrs_crpix[1], icrs_crpix[0]))) % 360.0
-    dec_init = float(np.degrees(np.arcsin(np.clip(icrs_crpix[2], -1, 1))))
-    init_pose = (ra_init, dec_init, cd_base_roll)
+    # Seed all three attitude degrees of freedom from the blind RANSAC/Wahba
+    # rotation. In particular, roll does NOT come from the label WCS.
+    init_pose = pose_from_R(R)
 
     pix_in, rdc_in = _matches_to_pairs(all_matches, det_xy_all)
     final_res = None
@@ -450,18 +473,18 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         pass3_matches = all_matches
     else:
         ra, dec, roll, cost, final_res = plate_solve(
-            pix_in, rdc_in, intr_keys, cd_base, cd_base_roll, init_pose)
+            pix_in, rdc_in, intr_keys, cd_intrinsic, init_pose)
         pose_pred = (ra, dec, roll)
 
         for tol_pix in (30.0, 5.0, 1.5):
-            w_cand = build_pose_wcs(*pose_pred, intr_keys, cd_base, cd_base_roll)
+            w_cand = build_pose_wcs(*pose_pred, intr_keys, cd_intrinsic)
             new_matches = refine_matches_by_projection(
                 w_cand, det_xy_all, identifier, img_w, img_h, tol_pix=tol_pix)
             if len(new_matches) < 4:
                 break
             pix_in, rdc_in = _matches_to_pairs(new_matches, det_xy_all)
             ra, dec, roll, cost, final_res = plate_solve(
-                pix_in, rdc_in, intr_keys, cd_base, cd_base_roll, pose_pred,
+                pix_in, rdc_in, intr_keys, cd_intrinsic, pose_pred,
                 bounds_deg=0.5, roll_bounds_deg=5.0)
             pose_pred  = (ra, dec, roll)
             all_matches = new_matches
@@ -473,10 +496,13 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     # refuse the answer rather than report a silent garbage attitude.
     if final_res is None or len(final_res) < 8:
         median_px_res = float("nan")
+        median_coordinate_res = float("nan")
         quality_ok = False
         quality_reason = "no_plate_solve"
     else:
-        median_px_res = float(np.median(np.abs(final_res)))
+        radial_res = pixel_residual_norms(final_res)
+        median_px_res = float(np.median(radial_res))
+        median_coordinate_res = float(np.median(np.abs(final_res)))
         quality_ok = median_px_res < 2.0 and len(pass3_matches) >= 8
         quality_reason = (None if quality_ok else
                           f"residual_{median_px_res:.1f}px_n={len(pass3_matches)}")
@@ -501,6 +527,8 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         return {"failed": True, "reason": f"quality_gate:{quality_reason}",
                 "n_det": len(det_xy_all), "n_matched": len(pass3_matches),
                 "median_px_residual": median_px_res,
+                "median_coordinate_residual_px": median_coordinate_res,
+                "residual_metric": "median_euclidean_px",
                 "angular_error_arcsec_if_kept": err,
                 "pose_pred_if_kept": pose_pred,
                 "det_xy": det_xy_all.tolist(),
@@ -519,6 +547,10 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         "pixel_error":          err / ps_arcsec,
         "plate_solve_cost":     cost,
         "median_px_residual":   median_px_res,
+        "median_coordinate_residual_px": median_coordinate_res,
+        "residual_metric":      "median_euclidean_px",
+        "attitude_seed":        "ransac_wahba_ra_dec_roll",
+        "calibration":          "sip_crpix_derotated_cd_scale_shear",
         "time_detect_s":        t_detect,
         "time_identify_s":      t_identify,
         "pose_pred":            pose_pred,

@@ -78,7 +78,7 @@ def main():
     # Load image + extra info
     img = np.array(Image.open(img_path), dtype=np.float32) / 255.0
     label = json.load(open(lbl_path))
-    intr_keys, cd_base, cd_roll = extract_camera_intrinsics(label["pose"]["wcs_header"])
+    intr_keys, cd_intrinsic, _ = extract_camera_intrinsics(label["pose"]["wcs_header"])
 
     det_xy     = np.array(r["det_xy"])
     det_xy_top = np.array(r.get("det_xy_top", []))
@@ -152,7 +152,7 @@ def main():
     if triangle is not None and not r["failed"]:
         ci, cj, ck = triangle[3:6]
         cat_vecs = identifier.db.star_vecs
-        wcs_pred = build_pose_wcs(*r["pose_pred"], intr_keys, cd_base, cd_roll)
+        wcs_pred = build_pose_wcs(*r["pose_pred"], intr_keys, cd_intrinsic)
         cat_idx = [ci, cj, ck]
         ra  = np.degrees(np.arctan2(cat_vecs[cat_idx, 1], cat_vecs[cat_idx, 0])) % 360
         dec = np.degrees(np.arcsin(np.clip(cat_vecs[cat_idx, 2], -1, 1)))
@@ -178,7 +178,7 @@ def main():
     if mp:
         ax5.scatter(det_xy[:, 0], det_xy[:, 1], facecolors="none",
                     edgecolors="red", s=15, linewidths=0.4, alpha=0.6)
-        wcs_pred = build_pose_wcs(*r["pose_pred"], intr_keys, cd_base, cd_roll)
+        wcs_pred = build_pose_wcs(*r["pose_pred"], intr_keys, cd_intrinsic)
         cat_ra  = np.array([m["ra_deg"]  for m in mp])
         cat_dec = np.array([m["dec_deg"] for m in mp])
         px_proj, py_proj = wcs_pred.all_world2pix(cat_ra, cat_dec, 0)
@@ -193,7 +193,7 @@ def main():
         title6 = "Step 6: FAILED (quality gate)"
     img_panel(ax6, title6)
     if mp and not r["failed"]:
-        wcs_pred = build_pose_wcs(*r["pose_pred"], intr_keys, cd_base, cd_roll)
+        wcs_pred = build_pose_wcs(*r["pose_pred"], intr_keys, cd_intrinsic)
         cat_ra  = np.array([m["ra_deg"]  for m in mp])
         cat_dec = np.array([m["dec_deg"] for m in mp])
         px_proj, py_proj = wcs_pred.all_world2pix(cat_ra, cat_dec, 0)

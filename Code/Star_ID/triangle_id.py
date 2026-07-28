@@ -32,6 +32,7 @@ Example:
 
 from __future__ import annotations
 
+import hashlib
 import pickle
 import random
 from dataclasses import dataclass
@@ -92,7 +93,15 @@ def build_pattern_db(catalog_csv: Path,
                      cache_path: Optional[Path] = None) -> PatternDB:
     catalog_csv = Path(catalog_csv)
     if cache_path is None:
-        cache_path = catalog_csv.parent / f"pattern_db_mag{mag_limit:.1f}.pkl"
+        digest = hashlib.sha256()
+        with open(catalog_csv, "rb") as catalog_file:
+            for block in iter(lambda: catalog_file.read(1024 * 1024), b""):
+                digest.update(block)
+        catalog_hash = digest.hexdigest()[:10]
+        cache_path = catalog_csv.parent / (
+            f"pattern_db_{catalog_csv.stem}_{catalog_hash}_"
+            f"mag{mag_limit:.1f}_fov{fov_deg:.1f}.pkl"
+        )
 
     if cache_path.exists():
         print(f"Loading cached pattern DB from {cache_path}")
@@ -208,6 +217,8 @@ class StarIdentifier:
         rng = random.Random(seed)
         best = None
         iterations_used = 0
+        last_best_score = None
+        stagnation_iters = 0
 
         for it in range(max_iter):
             iterations_used = it + 1
@@ -250,7 +261,7 @@ class StarIdentifier:
                             [body_vecs[i],     body_vecs[j],     body_vecs[k]],
                             [self.db.star_vecs[c_i], self.db.star_vecs[c_j], self.db.star_vecs[c_k]],
                         )
-                    except Exception:
+                    except np.linalg.LinAlgError:
                         continue
 
                     # Self-fit gate: a bad triplet can't even align its own three stars.
@@ -263,9 +274,9 @@ class StarIdentifier:
                     if max(seed_residuals) > MAX_RESIDUAL_ARCSEC:
                         continue
 
-                    # Two-pass verification: a wide tolerance gathers candidate matches
-                    # (3-point R has 10-30″ noise), then a Wahba refit on those candidates
-                    # gives an accurate R that survives the tight tolerance.
+                    # Two-pass verification: first collect a small set of
+                    # high-confidence 30″ matches. Refit R on those matches, then
+                    # expand to the 200″ tolerance needed at distorted frame edges.
                     R_seed  = R
                     INITIAL_VERIFY_TOL = np.radians(30.0 / 3600.0)
                     matches = self._verify_full(verify_body_vecs, R, INITIAL_VERIFY_TOL)
@@ -322,19 +333,17 @@ class StarIdentifier:
 
             # Early stop after sustained no-improvement past min_verified threshold.
             if best is not None and best.score >= min_verified and iterations_used >= 50:
-                if not hasattr(self, "_last_best_score"):
-                    self._last_best_score = best.score
-                    self._stagnation_iters = 0
-                elif best.score > self._last_best_score:
-                    self._last_best_score = best.score
-                    self._stagnation_iters = 0
+                if last_best_score is None:
+                    last_best_score = best.score
+                    stagnation_iters = 0
+                elif best.score > last_best_score:
+                    last_best_score = best.score
+                    stagnation_iters = 0
                 else:
-                    self._stagnation_iters += 1
-                    if self._stagnation_iters > 80:
+                    stagnation_iters += 1
+                    if stagnation_iters > 80:
                         if verbose:
                             print(f"  early exit: stagnated at score={best.score} for 80 iters")
-                        delattr(self, "_last_best_score")
-                        delattr(self, "_stagnation_iters")
                         return best
 
         if best is not None and best.score >= min_verified:
@@ -347,57 +356,63 @@ class StarIdentifier:
         within `tol_rad`. If `det_sign` is provided, also require matching
         triangle handedness to reject mirror-image solutions.
         """
-        v_i = self.db.star_vecs[c_i]
-        v_j = self.db.star_vecs[c_j]
+        sv = self.db.star_vecs
+        v_i = sv[c_i]
+        v_j = sv[c_j]
 
-        # Stars at angle ~θ_ik from v_i
-        dots_i = self.db.star_vecs @ v_i
-        cos_i_lo = np.cos(θ_ik + tol_rad)
-        cos_i_hi = np.cos(θ_ik - tol_rad)
-        mask_i = (dots_i >= cos_i_lo) & (dots_i <= cos_i_hi)
-
-        # Stars at angle ~θ_jk from v_j
-        dots_j = self.db.star_vecs @ v_j
-        cos_j_lo = np.cos(θ_jk + tol_rad)
-        cos_j_hi = np.cos(θ_jk - tol_rad)
-        mask_j = (dots_j >= cos_j_lo) & (dots_j <= cos_j_hi)
-
-        # Intersection — stars satisfying BOTH
-        candidates = np.where(mask_i & mask_j)[0]
-        candidates = [c for c in candidates if c != c_i and c != c_j]
-        if not candidates:
+        # Apply the first constraint against the full catalog once. The second
+        # constraint only touches the small survivor set.
+        dots_i = sv @ v_i
+        cand = np.where(
+            (dots_i >= np.cos(θ_ik + tol_rad))
+            & (dots_i <= np.cos(θ_ik - tol_rad))
+        )[0]
+        if cand.size == 0:
             return None
 
-        # Chirality filter — keep only candidates with matching triple-product sign
+        dots_j = sv[cand] @ v_j
+        keep = (
+            (dots_j >= np.cos(θ_jk + tol_rad))
+            & (dots_j <= np.cos(θ_jk - tol_rad))
+            & (cand != c_i)
+            & (cand != c_j)
+        )
+        cand = cand[keep]
+        dots_j = dots_j[keep]
+        if cand.size == 0:
+            return None
+
         if det_sign is not None:
             cross_ij = np.cross(v_i, v_j)
-            candidates = [
-                c for c in candidates
-                if np.sign(np.dot(cross_ij, self.db.star_vecs[c])) == det_sign
-            ]
-            if not candidates:
+            keep = np.sign(sv[cand] @ cross_ij) == det_sign
+            cand = cand[keep]
+            dots_j = dots_j[keep]
+            if cand.size == 0:
                 return None
 
-        # Pick the one closest to both targets (least error)
-        best_err = float("inf")
-        best_c = None
-        for c in candidates:
-            e_i = abs(np.arccos(np.clip(dots_i[c], -1, 1)) - θ_ik)
-            e_j = abs(np.arccos(np.clip(dots_j[c], -1, 1)) - θ_jk)
-            err = e_i + e_j
-            if err < best_err:
-                best_err = err
-                best_c   = int(c)
-        return best_c
+        e_i = np.abs(np.arccos(np.clip(dots_i[cand], -1, 1)) - θ_ik)
+        e_j = np.abs(np.arccos(np.clip(dots_j, -1, 1)) - θ_jk)
+        return int(cand[np.argmin(e_i + e_j)])
 
     def _verify_full(self, body_vecs, R, tol_rad):
         """
         Project body vectors through R into ICRS.
         For each, find nearest catalog star — if within tol, match.
         Returns {det_idx: cat_idx}.
+
+        Only catalog stars inside a 12° cone around the candidate boresight can
+        match an in-frame TESS detection. Culling to that cone reduces the
+        nearest-neighbour score matrix from roughly 25,000 columns to ~150
+        without changing the returned match.
         """
         body_in_icrs = body_vecs @ R.T
-        dots = body_in_icrs @ self.db.star_vecs.T
+
+        boresight = R @ np.array([1.0, 0.0, 0.0])
+        cone_cos = np.cos(np.radians(12.0))
+        cat_idx = np.where(self.db.star_vecs @ boresight >= cone_cos)[0]
+        if cat_idx.size == 0:
+            return {}
+        dots = body_in_icrs @ self.db.star_vecs[cat_idx].T
         cos_tol = np.cos(tol_rad)
 
         matches = {}
@@ -407,8 +422,10 @@ class StarIdentifier:
         best_score_per_det = dots[np.arange(len(body_vecs)), best_per_det]
         order = np.argsort(-best_score_per_det)
         for di in order:
-            ci = int(best_per_det[di])
-            if best_score_per_det[di] >= cos_tol and ci not in used_cat:
+            if best_score_per_det[di] < cos_tol:
+                continue
+            ci = int(cat_idx[best_per_det[di]])
+            if ci not in used_cat:
                 matches[int(di)] = ci
                 used_cat.add(ci)
         return matches

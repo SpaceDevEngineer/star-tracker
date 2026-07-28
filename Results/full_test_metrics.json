@@ -1,0 +1,37 @@
+{
+  "evaluation": "full lost-in-space TESS test split",
+  "attitude_convention": "body-to-ICRS; physical roll about body +x; physical_roll_deg = (180 - CD_angle_deg) mod 360",
+  "calibration": "SIP + CRPIX + de-rotated per-CCD CD scale/shear",
+  "counts": {
+    "total_frames": 120,
+    "missing_wcs_frames": 13,
+    "valid_frames": 107,
+    "solved_frames": 104,
+    "algorithm_refusals": 3,
+    "false_locks": 0
+  },
+  "solve_rate_valid_percent": 97.19626168224299,
+  "attitude_error_arcsec": {
+    "median": 8.975795770363124,
+    "mean": 10.74938483118987,
+    "p90": 19.411211984597518,
+    "p95": 22.150997656024128,
+    "min": 1.1025905643481504,
+    "max": 42.512272668824345
+  },
+  "axis_error_arcsec": {
+    "cross_boresight_median": 2.737317859422996,
+    "cross_boresight_p90": 4.854185992677846,
+    "roll_median": 8.325116757781274,
+    "roll_p90": 19.26947228388859
+  },
+  "threshold_counts": {
+    "subpixel_below_20_57_arcsec": 95,
+    "below_60_arcsec": 104
+  },
+  "provenance": {
+    "source_artifacts": "120 per-frame JSON files from the thesis evaluation run",
+    "normalization": "Legacy stored CD-angle poses were converted to physical body roll before recomputing quaternion errors",
+    "generated_utc": "2026-07-28"
+  }
+}

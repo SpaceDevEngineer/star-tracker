@@ -7,7 +7,7 @@ produces, for each image:
   1. <stem>_overlay.png  — image + UNet detections (red), projected catalog
                            after plate-solve (blue), matched pairs (green lines).
                            Title carries the angular error, # matches, and
-                           median pixel residual.
+                           median Euclidean pixel residual.
   2. <stem>_residuals.png — per-star pixel-residual heatmap + histogram.
 
 Plus one summary figure:
@@ -56,8 +56,8 @@ def per_image_overlay(img_arr, art, label, out_path):
 
     if not art["failed"]:
         # Project catalog stars near boresight through the predicted WCS
-        intr, cd_base, cd_roll = extract_camera_intrinsics(label["pose"]["wcs_header"])
-        wcs_pred = build_pose_wcs(*art["pose_pred"], intr, cd_base, cd_roll)
+        intr, cd_intrinsic, _ = extract_camera_intrinsics(label["pose"]["wcs_header"])
+        wcs_pred = build_pose_wcs(*art["pose_pred"], intr, cd_intrinsic)
         # Use the matched catalog stars (sufficient for visualisation)
         mp = art["matched_pairs"]
         cat_ra  = np.array([m["ra_deg"]  for m in mp])
@@ -91,8 +91,8 @@ def residual_map(art, label, out_path):
     """Per-star residual scatter + histogram."""
     if art["failed"] or not art["matched_pairs"]:
         return
-    intr, cd_base, cd_roll = extract_camera_intrinsics(label["pose"]["wcs_header"])
-    wcs_pred = build_pose_wcs(*art["pose_pred"], intr, cd_base, cd_roll)
+    intr, cd_intrinsic, _ = extract_camera_intrinsics(label["pose"]["wcs_header"])
+    wcs_pred = build_pose_wcs(*art["pose_pred"], intr, cd_intrinsic)
     mp = art["matched_pairs"]
     px_obs = np.array([m["px"]      for m in mp])
     py_obs = np.array([m["py"]      for m in mp])
@@ -177,6 +177,8 @@ def main():
     ap.add_argument("--data-dir", required=True, help="Directory containing images/ and labels/")
     ap.add_argument("--run-dir",  required=True, help="Directory containing <stem>.json artefacts")
     ap.add_argument("--out-dir",  required=True, help="Where to write the visualisations")
+    ap.add_argument("--summary-only", action="store_true",
+                    help="Only regenerate summary.png (skip per-image plots).")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -188,6 +190,9 @@ def main():
     for art_path in sorted(run_dir.glob("*.json")):
         art = json.load(open(art_path))
         artefacts.append(art)
+
+        if args.summary_only:
+            continue
 
         stem = art_path.stem
         img_path = data_dir / "images" / f"{stem}.png"
@@ -205,7 +210,10 @@ def main():
         print(f"  {stem[-30:]:<30}  {status}")
 
     summary_figure(artefacts, out_dir / "summary.png")
-    print(f"\nWrote {len(artefacts)} per-image plots + summary.png to {out_dir}")
+    if args.summary_only:
+        print(f"Wrote summary.png for {len(artefacts)} artefacts to {out_dir}")
+    else:
+        print(f"\nWrote {len(artefacts)} per-image plots + summary.png to {out_dir}")
 
 
 if __name__ == "__main__":

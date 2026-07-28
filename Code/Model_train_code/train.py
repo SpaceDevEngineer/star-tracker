@@ -452,7 +452,7 @@ def _save_samples(model, loader, device, out_dir, n_samples=4):
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir",   default="/Users/timon/Desktop/Thesis/Data/dataset_tess_pilot",
+    p.add_argument("--data-dir",   required=True,
                    help="Folder with images/ and labels/ sub-dirs.")
     p.add_argument("--out-dir",    default="Results/unet_run1",
                    help="Where to save model weights and plots.")

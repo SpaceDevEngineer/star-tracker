@@ -10,7 +10,7 @@
 
 Built an end-to-end "lost-in-space" attitude determination pipeline that recovers a
 spacecraft's 3-axis orientation from a single raw star-field image, achieving sub-pixel
-accuracy (median 6.8″ ≈ 0.33 px) on real TESS satellite data. Combined a CNN star
+accuracy (median 8.98″ ≈ 0.44 px) on real TESS satellite data. Combined a CNN star
 detector (U-Net / HRNet) with RANSAC triangle star identification, Wahba SVD, and
 nonlinear plate-solve refinement.
 
@@ -32,8 +32,9 @@ iterative plate-solve refinement → attitude quaternion.
 Key contributions:
 
 - Trained and compared two CNN architectures (U-Net, 7.7M params; HRNet, 4.0M params)
-  for star centroid detection via heatmap regression — showed HRNet matches U-Net
-  accuracy at half the model size.
+  for star centroid detection via heatmap regression — observed a 0.2″ median gap
+  while HRNet used roughly half the model size; formal equivalence testing remains
+  future work.
 - Diagnosed a critical geometric failure: wide-FOV TESS optics introduce 6th-order SIP
   polynomial distortion that a naïve pinhole projection cannot model (200–1000″ errors
   at frame corners). Re-architected the geometry layer around SIP-corrected body vectors.
@@ -44,8 +45,8 @@ Key contributions:
 - Built diagnostic visualizations and an interactive Streamlit walkthrough of every
   pipeline stage.
 
-Result: 100% star detection, 94% reliable attitude solve rate, **median attitude error
-6.8″ (sub-pixel, ~0.33 px at 20.6″/px plate scale)** in full lost-in-space mode.
+Result: 104/107 valid frames solved (97.2%), 0 false locks, **median attitude error
+8.98″ (~0.44 px at 20.57″/px plate scale)** in full lost-in-space mode.
 
 ---
 
@@ -74,7 +75,9 @@ satellite images** rather than synthetic data.
 3. **Camera geometry** — Converted detected pixel centroids to 3-D body unit vectors.
    Identified that linear pinhole projection fails on TESS's 12° field of view due to
    optical distortion; replaced it with **SIP-polynomial-corrected gnomonic projection**,
-   making body-vector angles consistent with catalog angles.
+   making body-vector angles consistent with catalog angles. Explicitly factored the
+   rotational part out of the FITS CD matrix and initialized physical roll from the
+   blind RANSAC/Wahba rotation rather than from ground-truth WCS orientation.
 
 4. **Star identification** — RANSAC-based triangle matching: random detection triplets
    matched against a pre-computed Hipparcos pair-angle database (5.3M pairs,
@@ -95,17 +98,17 @@ Real TESS test imagery, lost-in-space mode, no ground-truth hints:
 
 | Metric | Value |
 |---|---|
-| Star detection rate | 100% |
-| Attitude solve rate | 94% (15/16), 0 false locks |
-| Median attitude error | 6.8″ (0.33 px) |
-| 90th percentile | 18.2″ (0.89 px) |
+| Valid evaluation frames | 107 / 120 (13 lack WCS calibration) |
+| Attitude solve rate | 97.2% (104/107), 0 false locks |
+| Median attitude error | 8.98″ (0.44 px) |
+| 90th percentile | 19.41″ (0.94 px) |
+| Cross-boresight / roll median | 2.74″ / 8.33″ |
 | Centroid-limited benchmark (U-Net / HRNet) | 4.6″ / 4.8″ median |
-| Best single image | 2.3″ (0.11 px) |
+| Best single image | 1.10″ (0.05 px) |
 
-Demonstrated that detector architecture is not the accuracy bottleneck — the compact
-HRNet (half the parameters) matches U-Net — and that the limiting factor is residual
-optical distortion, identifying camera factory-calibration as the path to
-sub-arcsecond accuracy.
+The small observed detector gap suggests that architecture is not the dominant
+accuracy bottleneck. Residual optical distortion is the stronger limitation,
+identifying camera factory-calibration as the path to sub-arcsecond accuracy.
 
 ---
 

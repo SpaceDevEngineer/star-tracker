@@ -14,6 +14,7 @@ from inference_full import (  # noqa: E402
     extract_camera_intrinsics,
     pixel_residual_norms,
     pose_from_R,
+    radec_to_unit_vec,
 )
 
 
@@ -57,3 +58,37 @@ def test_pixel_residuals_are_radial_per_star():
     # least_squares layout is [dx0, dx1, ..., dy0, dy1, ...]
     residuals = np.array([3.0, 5.0, 4.0, 12.0])
     np.testing.assert_allclose(pixel_residual_norms(residuals), [5.0, 13.0])
+
+
+def _sky_grid(wcs):
+    gx, gy = np.meshgrid(np.linspace(50, 2080, 15), np.linspace(50, 2020, 15))
+    ra, dec = wcs.all_pix2world(gx.ravel(), gy.ravel(), 0)
+    return radec_to_unit_vec(ra, dec)
+
+
+def _rigid_rotation(a, b):
+    """Rotation R minimising |b - R a| (Kabsch / Wahba)."""
+    u, _, vt = np.linalg.svd(b.T @ a)
+    return u @ np.diag([1.0, 1.0, np.linalg.det(u @ vt)]) @ vt
+
+
+def test_pose_parameters_match_the_sky_rotation_of_the_wcs():
+    """A change of (RA, Dec, roll) must move the sky exactly as _R_from_pose says.
+
+    This ties the scored attitude error to geometry: both the size and the sign
+    of a roll change are checked against the rigid rotation between the sky
+    grids of two synthesized WCS.
+    """
+    label_path = sorted((ROOT / "Data" / "dataset_tess_test" / "labels").glob("*.json"))[0]
+    header = json.loads(label_path.read_text())["pose"]["wcs_header"]
+    intrinsics, cd_intrinsic, roll = extract_camera_intrinsics(header)
+    ra, dec = header["CRVAL1"], header["CRVAL2"]
+    base = _sky_grid(build_pose_wcs(ra, dec, roll, intrinsics, cd_intrinsic))
+
+    for d_ra, d_dec, d_roll in ((0.0, 0.0, 0.03), (0.01, 0.0, 0.0), (0.0, 0.01, -0.02)):
+        moved = _sky_grid(build_pose_wcs(ra + d_ra, dec + d_dec, roll + d_roll,
+                                         intrinsics, cd_intrinsic))
+        r_sky = _rigid_rotation(base, moved)
+        r_model = (_R_from_pose(ra + d_ra, dec + d_dec, roll + d_roll)
+                   @ _R_from_pose(ra, dec, roll).T)
+        np.testing.assert_allclose(r_sky, r_model, atol=1e-9)

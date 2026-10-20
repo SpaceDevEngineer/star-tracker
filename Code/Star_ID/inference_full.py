@@ -4,6 +4,7 @@ End-to-end lost-in-space attitude pipeline.
 Stages:
     PNG → U-Net detection → SIP-corrected body vectors → Triangle Star ID
     → Wahba SVD → plate-solve refinement → quality gate → attitude quaternion
+    (a quality-gate refusal triggers a significance-aware refusal-retry)
 
 Usage:
     python inference_full.py \
@@ -109,6 +110,9 @@ def extract_camera_intrinsics(wcs_dict):
 
     We factor the rotation out before returning ``cd_intrinsic``. This prevents
     the plate solver from receiving the ground-truth roll through the label WCS.
+    The rotation is the angle of the closest similarity transform,
+    atan2(CD21 - CD12, CD11 + CD22); TESS CD matrices have det > 0, so the
+    focal plane maps onto the sky without a reflection.
 
     Returns:
         intr_keys : header fields copied verbatim into every synthesized WCS
@@ -131,14 +135,14 @@ def extract_camera_intrinsics(wcs_dict):
                       dtype=np.float64)
         cdelt = np.diag([wcs_dict.get("CDELT1", 1.0), wcs_dict.get("CDELT2", 1.0)])
         cd = pc @ cdelt
-    cd_angle = float(np.degrees(np.arctan2(cd[0, 1], cd[0, 0])))
+    cd_angle = float(np.degrees(np.arctan2(cd[1, 0] - cd[0, 1], cd[0, 0] + cd[1, 1])))
     a = np.radians(-cd_angle)
     unrotate = np.array([[np.cos(a), -np.sin(a)],
                          [np.sin(a),  np.cos(a)]])
     cd_intrinsic = unrotate @ cd
-    # Camera convention: increasing pixel x points along -body-y. Therefore a
-    # zero physical body roll corresponds to a 180° CD angle.
-    physical_roll = (180.0 - cd_angle) % 360.0
+    # Camera convention: body (y, z) = -(pixel offset), i.e. a 180° turn of the
+    # focal plane, so a zero physical body roll corresponds to a 180° CD angle.
+    physical_roll = (cd_angle + 180.0) % 360.0
     return intr_keys, cd_intrinsic, physical_roll
 
 
@@ -149,7 +153,7 @@ def build_pose_wcs(ra_b_deg, dec_b_deg, roll_deg, intr_keys, cd_intrinsic):
     candidate roll is applied explicitly, so no frame attitude is inherited
     from the ground-truth WCS.
     """
-    cd_angle = np.radians(180.0 - roll_deg)
+    cd_angle = np.radians(roll_deg - 180.0)
     c, s = np.cos(cd_angle), np.sin(cd_angle)
     R2 = np.array([[c, -s], [s, c]])
     cd = R2 @ cd_intrinsic
@@ -357,12 +361,51 @@ def detect_unet(model, img_np, device, threshold=0.55, flux_window=7):
     return xy, bs
 
 
+def inject_false_stars(det_xy, det_bright, img_shape, frac, seed):
+    """
+    Stress-test hook: add `frac` × N spurious detections at uniformly random
+    pixel positions, with brightnesses drawn from the real detections so the
+    fakes mix into the top-N used for the triangle search rather than sitting
+    harmlessly at the faint end.
+
+    This is what moves the pipeline into the regime the Pyramid gate was
+    designed for — high false-star contamination, where triangle-only search
+    starts producing false locks. Deterministic given `seed`.
+    """
+    if frac <= 0:
+        return det_xy, det_bright, 0
+    h, w = img_shape
+    rng = np.random.default_rng(seed)
+    n_fake = int(round(frac * len(det_xy)))
+    if n_fake <= 0:
+        return det_xy, det_bright, 0
+    fake_xy = np.stack([rng.uniform(0, w, n_fake),
+                        rng.uniform(0, h, n_fake)], axis=-1).astype(np.float32)
+    # Resample real brightnesses → fakes are indistinguishable by magnitude
+    fake_b = rng.choice(det_bright, size=n_fake, replace=True).astype(np.float32)
+    return (np.concatenate([det_xy, fake_xy], axis=0),
+            np.concatenate([det_bright, fake_b], axis=0),
+            n_fake)
+
+
 def solve_attitude_full(model, identifier, img_path, lbl_path, device,
                         unet_threshold=0.55, top_n_bright=60, verbose=True,
-                        debug_gt=False):
+                        debug_gt=False, pyramid="off", gate_audit=False,
+                        false_star_frac=0.0, stress_seed=0, max_iter=1500,
+                        exclude_boresights=None, exclude_radius_deg=6.0,
+                        min_significance=0.0):
     """
     Full lost-in-space pipeline for one image. Returns a dict with the
     predicted attitude, ground-truth comparison, match table, and timing.
+
+    pyramid / gate_audit: forwarded to StarIdentifier.identify() — see there.
+                          Default "off" reproduces the published baseline.
+    false_star_frac:      stress-test contamination level (see inject_false_stars).
+    max_iter:             RANSAC cap. Matters: a frame that never locks burns
+                          every iteration (~4.4 s each), so an unsolvable frame
+                          costs ~1.8 h at the default 1500. Lower it for the
+                          high-contamination stress arms, where refusals are the
+                          expected outcome rather than an anomaly.
     """
     img_np = np.array(Image.open(img_path), dtype=np.float32) / 255.0
     with open(lbl_path) as f:
@@ -394,6 +437,10 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     if len(det_xy_all) < 10:
         return {"failed": True, "reason": "too_few_detections", "n_det": len(det_xy_all)}
 
+    # --- Stage 1b: optional false-star contamination (stress test) ---------
+    det_xy_all, det_bright, n_fake = inject_false_stars(
+        det_xy_all, det_bright, label["image_shape"], false_star_frac, stress_seed)
+
     # --- Stage 2: body vectors (SIP-corrected) -----------------------------
     bright_order = np.argsort(-det_bright)
     det_xy = det_xy_all[bright_order[:top_n_bright]]
@@ -404,14 +451,27 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     t1 = time.time()
     id_result = identifier.identify(body_vecs,
                                     verify_body_vecs=body_vecs_all,
+                                    pyramid=pyramid,
+                                    gate_audit=gate_audit,
+                                    max_iter=max_iter,
+                                    exclude_boresights=exclude_boresights,
+                                    exclude_radius_deg=exclude_radius_deg,
+                                    min_significance=min_significance,
                                     verbose=verbose)
     t_identify = time.time() - t1
 
+    gate_dict = (id_result.gate.as_dict()
+                 if id_result is not None and id_result.gate is not None else None)
+
     if id_result is None:
         return {"failed": True, "reason": "id_failed",
-                "n_det": len(det_xy_all), "n_top": len(det_xy)}
+                "n_det": len(det_xy_all), "n_top": len(det_xy),
+                "n_false_injected": n_fake,
+                "time_identify_s": t_identify,
+                "pyramid": pyramid, "gate": gate_dict}
 
     # --- Stage 4: refine R against all detections, capped by drift gate ----
+    t_refine0 = time.time()      # timing only: stages 4-6 (refine, plate solve, gate)
     # Tolerance is sized to the SIP-corrected body-vec residual at the edges (~200″).
     # The drift gate prevents the refit from sliding off to a different self-
     # consistent constellation when the initial set of matches contains outliers.
@@ -422,7 +482,20 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
     MAX_FINAL_DRIFT_DEG = 2
 
     for _ in range(2):
-        all_matches = identifier._verify_full(body_all, R, verify_tol_rad)
+        body_in_icrs = body_all @ R.T
+        dots = body_in_icrs @ identifier.db.star_vecs.T
+        cos_tol = np.cos(verify_tol_rad)
+
+        best_cat = np.argmax(dots, axis=1)
+        best_score = dots[np.arange(len(body_all)), best_cat]
+        order = np.argsort(-best_score)
+        all_matches = {}
+        used_cat = set()
+        for di in order:
+            ci = int(best_cat[di])
+            if best_score[di] >= cos_tol and ci not in used_cat:
+                all_matches[int(di)] = ci
+                used_cat.add(ci)
 
         if len(all_matches) < 4:
             break
@@ -462,7 +535,8 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         return det_xy_arr[di], np.stack([ra, dec], axis=-1)
 
     # Seed all three attitude degrees of freedom from the blind RANSAC/Wahba
-    # rotation. In particular, roll does NOT come from the label WCS.
+    # rotation. Body +x is the SIP reference pixel (CRPIX), so the boresight
+    # of R is the CRVAL seed; roll does NOT come from the label WCS.
     init_pose = pose_from_R(R)
 
     pix_in, rdc_in = _matches_to_pairs(all_matches, det_xy_all)
@@ -531,6 +605,12 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
                 "residual_metric": "median_euclidean_px",
                 "angular_error_arcsec_if_kept": err,
                 "pose_pred_if_kept": pose_pred,
+                "refused_boresight_icrs": (R_id @ np.array([1.0, 0.0, 0.0])).tolist(),
+                "iterations":       id_result.iterations,
+                "time_identify_s":  t_identify,
+                "time_refine_s":    time.time() - t_refine0,
+                "n_false_injected": n_fake,
+                "pyramid": pyramid, "gate": gate_dict,
                 "det_xy": det_xy_all.tolist(),
                 "matched_pairs": matched_pairs}
 
@@ -538,7 +618,11 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         "failed": False,
         "n_det":          len(det_xy_all),
         "n_top":          len(det_xy),
+        "n_false_injected": n_fake,
+        "pyramid":        pyramid,
+        "gate":           gate_dict,
         "n_matched_id":   len(id_result.matches),
+        "id_significance": id_result.significance,
         "n_matched":      len(pass3_matches),
         "iterations":     id_result.iterations,
         "triangle":       list(id_result.triangle),
@@ -549,10 +633,12 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         "median_px_residual":   median_px_res,
         "median_coordinate_residual_px": median_coordinate_res,
         "residual_metric":      "median_euclidean_px",
+        "attitude_convention":  "physical_body_roll_deg",
         "attitude_seed":        "ransac_wahba_ra_dec_roll",
         "calibration":          "sip_crpix_derotated_cd_scale_shear",
         "time_detect_s":        t_detect,
         "time_identify_s":      t_identify,
+        "time_refine_s":        time.time() - t_refine0,
         "pose_pred":            pose_pred,
         "pose_gt":              (ra_gt, dec_gt, roll_gt),
         "q_pred":               q_pred,
@@ -560,6 +646,47 @@ def solve_attitude_full(model, identifier, img_path, lbl_path, device,
         "det_xy":               det_xy_all.tolist(),
         "matched_pairs":        matched_pairs,
     }
+
+
+def solve_attitude_with_retry(model, identifier, img_path, lbl_path, device,
+                              max_retries=2, exclude_radius_deg=6.0,
+                              retry_min_significance=5.0, **kw):
+    """
+    Refusal-retry wrapper around `solve_attitude_full`.
+
+    The only failure mode observed on real TESS frames is a false lock onto a
+    dense-sky attractor that the post-fit quality gate refuses. When that
+    happens the search is re-run with the refused boresight region forbidden
+    (`exclude_boresights`), up to `max_retries` times. A frame that solves on
+    the first attempt is returned untouched, so this cannot change any solved
+    frame; every retried answer must pass the same quality gate, so it cannot
+    let through a false lock the gate would have caught.
+
+    Retries also switch on significance-aware stopping
+    (`retry_min_significance`, see StarIdentifier.identify): the search may
+    only stop early on a hypothesis that beats the chance-match level of its
+    own sky region by that factor, so a dense-field impostor with 16-21 raw
+    matches can no longer end the search before the true triangle is drawn.
+    """
+    excluded, attempts = [], []
+    r = solve_attitude_full(model, identifier, img_path, lbl_path, device, **kw)
+    for _ in range(max_retries):
+        reason = str(r.get("reason") or "")
+        if not (r.get("failed") and reason.startswith("quality_gate")
+                and r.get("refused_boresight_icrs") is not None):
+            break
+        attempts.append({"reason": reason,
+                         "pose_if_kept": r.get("pose_pred_if_kept"),
+                         "error_if_kept": r.get("angular_error_arcsec_if_kept"),
+                         "time_identify_s": r.get("time_identify_s")})
+        excluded.append(r["refused_boresight_icrs"])
+        r = solve_attitude_full(model, identifier, img_path, lbl_path, device,
+                                exclude_boresights=excluded,
+                                exclude_radius_deg=exclude_radius_deg,
+                                min_significance=retry_min_significance, **kw)
+    r["retry_attempts"] = attempts
+    r["n_attempts"] = len(attempts) + 1
+    return r
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +703,13 @@ def main():
                     help="Hipparcos catalog CSV (hipparcos_id, ra_deg, dec_deg, mag).")
     ap.add_argument("--threshold", type=float, default=0.55,
                     help="U-Net heatmap detection threshold (default 0.55).")
-    ap.add_argument("--mag-limit", type=float, default=6.0,
-                    help="Magnitude cutoff for catalog stars (default 6.0).")
+    ap.add_argument("--mag-limit", type=float, default=7.5,
+                    help="Magnitude cutoff for catalog stars (default 7.5).")
+    ap.add_argument("--retries", type=int, default=2,
+                    help="Refusal-retries after a quality-gate refusal: the "
+                         "refused sky region is excluded and significance-"
+                         "aware stopping is switched on (default 2; 0 = "
+                         "first attempt only).")
     ap.add_argument("--n-images",  type=int, default=0,
                     help="Stop after this many images (0 = all).")
     ap.add_argument("--split",     choices=("all", "train", "val", "test"),
@@ -637,8 +769,9 @@ def main():
         if not lbl_path.exists():
             continue
 
-        r = solve_attitude_full(
+        r = solve_attitude_with_retry(
             model, identifier, img_path, lbl_path, device,
+            max_retries=args.retries,
             unet_threshold=args.threshold, verbose=args.debug,
         )
 
@@ -652,7 +785,8 @@ def main():
                   f"{r['n_matched']:>6} "
                   f"{r['iterations']:>5} "
                   f"{r['time_identify_s']:>6.1f}s "
-                  f"{r['angular_error_arcsec']:>9.2f}\"")
+                  f"{r['angular_error_arcsec']:>9.2f}\""
+                  + (f"  (retry {r['n_attempts'] - 1})" if r["n_attempts"] > 1 else ""))
             results.append(r)
 
         if out_dir:
@@ -668,6 +802,7 @@ def main():
     print(f"\n{'='*70}")
     print(f"Lost-in-space pipeline summary:")
     print(f"  Solved       : {n_ok}/{n_total}  ({100 * n_ok / max(n_total, 1):.1f}%)")
+    print(f"  Retried      : {sum(r.get('n_attempts', 1) > 1 for r in results)}")
     if errors:
         e = np.array(errors)
         print(f"  Median error : {np.median(e):.2f}\"")

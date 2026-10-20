@@ -1,128 +1,148 @@
-# Star Tracker — Spacecraft Attitude Determination from Real Satellite Imagery
+# Star Tracker: lost-in-space spacecraft attitude from real NASA TESS images
 
-**Blind spacecraft-attitude estimation on real NASA TESS imagery, built with deep
-learning + classical geometry.** Given a single image plus calibrated camera intrinsics
-(SIP, CRPIX, and de-rotated CD scale/shear), the pipeline identifies the star field and
-recovers all three attitude degrees of freedom without an initial pose or IMU prior.
+[![CI](https://github.com/SpaceDevEngineer/star-tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/SpaceDevEngineer/star-tracker/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-U--Net-ee4c2c)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Live demo](https://img.shields.io/badge/demo-Streamlit-ff4b4b)](https://star-tracker-6vwnvtkvpow2eysg23i45l.streamlit.app)
+
+**Given one photo of the sky and nothing else, which way is the spacecraft pointing?**
+This project answers that on **real images taken in orbit by NASA's TESS satellite**,
+with no initial guess, no gyroscope and no star labels. A U-Net finds the stars and
+measures their positions to a fraction of a pixel. Classical geometry (triangle
+matching, RANSAC, Wahba's problem, plate solving) then works out the full 3-axis attitude.
+Every answer is checked, so the system either returns the right answer or refuses.
 
 ### 🎯 [Try the live interactive demo →](https://star-tracker-6vwnvtkvpow2eysg23i45l.streamlit.app)
 
-*Walks through every pipeline stage with the actual numbers (detections, triangle, plate-solve,
-quality gate, final pose) on 16 real TESS images. Replay mode renders in ~5 seconds; Live mode
-runs the full RANSAC + plate-solve.*
+*Walks through every pipeline stage with the real numbers (detections, triangle,
+plate solve, quality gate, final attitude) on 16 TESS images. Replay mode renders in
+about 5 seconds; Live mode runs the full search.*
 
 ![Pipeline overview](docs/images/pipeline_cam1-ccd1.png)
-*Six pipeline stages: from raw TESS frame to attitude quaternion.*
 
 ---
 
-## Results in one table
+## Results
 
-End-to-end lost-in-space attitude on the full real-TESS test split. Thirteen frames
-without WCS calibration are reported as data exclusions; solve rate is measured over
-the 107 valid frames.
+End-to-end lost-in-space attitude on **248 real TESS frames**: the held-out test
+split, plus 8 TESS sectors that played no part in training or model selection.
 
-| Metric | Value |
-|---|---|
-| Attitude solve rate | **104 / 107 (97.2%)** |
-| Median angular error | **8.98″** (0.44 px at 20.57″/px) |
-| 90th percentile | **19.41″** (0.94 px) |
-| Cross-boresight / roll median | **2.74″ / 8.33″** |
-| Below one pixel | **95 / 104** solved frames |
-| Below one arcminute | **104 / 104** solved frames |
-| False locks | **0** — three candidates honestly refused |
-
-The repository bundles a compact 16-frame replay/demo subset: **15/16 solved,
-6.63″ median, 0 false locks**. Machine-readable full-test metrics are in
-[`Results/full_test_metrics.json`](Results/full_test_metrics.json), with all
-120 frame outcomes in
-[`Results/full_test_per_frame.csv`](Results/full_test_per_frame.csv).
-
-Detector benchmark (centroid quality, `--use-gt` mode, 120 test images):
-
-| Detector | Parameters | Median error |
+| | Test split | Unseen sectors |
 |---|---:|---:|
-| U-Net  | 7.76 M | 4.6″ |
-| HRNet  | **3.99 M** | 4.8″ |
+| Frames solved | **120 / 120** | **128 / 128** |
+| Wrong answers (false locks) | **0** | **0** |
+| Median attitude error | **7.79″** (0.38 px) | **7.33″** (0.36 px) |
+| 90th percentile | 13.87″ | 15.02″ |
+| Worst frame | 20.39″ | 25.35″ |
+| Errors below one pixel (20.57″) | 120 / 120 | 125 / 128 |
+| Median pointing / roll error | 2.78″ / 7.10″ | 2.61″ / 6.50″ |
+| Solved at first attempt / after a retry | 117 / 3 | 124 / 4 |
 
-The medians differ by only 0.2″ while HRNet uses half the parameters. This suggests
-that detector architecture is not the dominant accuracy bottleneck; a formal paired
-confidence interval remains future work.
+- **Sub-pixel accuracy.** The typical error is about a third of a pixel. One pixel
+  covers 20.57 arcseconds of sky.
+- **Generalises.** The unseen sectors (different years and different parts of the sky)
+  give the same accuracy as the test split. 95% confidence interval for the solve
+  rate: 96.9–100% (test) and 97.1–100% (unseen sectors).
+- **Fast enough to iterate on.** Typical frame time is **9.4 s** (median over all 248
+  frames, U-Net on GPU). That is 27× faster than the first version, with identical
+  results on every frame.
+- **Never confidently wrong.** In 248 frames, no wrong attitude was ever returned.
 
----
+![Attitude error distribution](docs/images/results.png)
 
-## What this is
-
-A complete star-tracker pipeline that converts a single sky image into a camera
-attitude quaternion, given the camera's calibrated intrinsics. Validated on
-**real TESS satellite imagery** (not simulations), in *lost-in-space*
-mode — no initial pose guess, no IMU prior, and no supplied catalog correspondences.
-RANSAC/Wahba initializes RA, Dec, and physical body roll; the label WCS is used
-only to supply camera calibration and to score the final result.
-
-```
-        PNG image (2136 × 2078) + camera intrinsics (SIP + CRPIX + CD)
-                │
-                ▼
-   ┌────────────────────────────┐
-   │  Stage 1 — CNN detection   │   U-Net / HRNet → ~480 sub-pixel centroids
-   └────────────────────────────┘
-                │
-                ▼
-   ┌────────────────────────────┐
-   │  Stage 2 — Body vectors    │   SIP-corrected gnomonic projection
-   └────────────────────────────┘
-                │
-                ▼
-   ┌────────────────────────────┐
-   │  Stage 3 — Triangle ID     │   RANSAC + Hipparcos pair-DB + 3-point Wahba SVD
-   └────────────────────────────┘
-                │
-                ▼
-   ┌────────────────────────────┐
-   │  Stage 4 — Refine R        │   Wahba refit on all verified detections
-   └────────────────────────────┘
-                │
-                ▼
-   ┌────────────────────────────┐
-   │  Stage 5 — Plate-solve     │   scipy least-squares over (RA, Dec, roll)
-   └────────────────────────────┘
-                │
-                ▼
-   ┌────────────────────────────┐
-   │  Stage 6 — Quality gate    │   honest "no-solution" if residual > 2 px
-   └────────────────────────────┘
-                │
-                ▼
-       Attitude quaternion
-```
+Per-frame results for all 248 frames are in
+[`Results/full_test_per_frame.csv`](Results/full_test_per_frame.csv) and
+[`Results/unseen_sectors_per_frame.csv`](Results/unseen_sectors_per_frame.csv). The summary
+metrics are in [`full_test_metrics.json`](Results/full_test_metrics.json) and
+[`unseen_sectors_metrics.json`](Results/unseen_sectors_metrics.json). More tables are in
+[RESULTS.md](RESULTS.md).
 
 ---
 
-## Why I think this is interesting
+## How it works
 
-1. **Real satellite data, not synthetic.** Most public star-tracker projects train
-   and evaluate on procedurally generated star fields. TESS images carry real noise,
-   real optical distortion, real diffraction spikes, and saturated bright stars.
+```
+   TESS image (2136 × 2078 px) + camera calibration (SIP distortion, CRPIX, CD scale/shear)
+        │
+   1  U-Net detection        16 tiles of 512×512 → heatmap → ~450 sub-pixel star centroids
+        │
+   2  Body vectors           remove lens distortion (SIP) → unit direction for every star
+        │
+   3  Star identification    RANSAC over triangles of bright stars, matched against a
+        │                    Hipparcos pair-angle database (25k stars, V < 7.5)
+   4  Attitude               Wahba's problem (SVD) on every verified star
+        │
+   5  Plate solve            least-squares refinement of (RA, Dec, roll) in pixel space
+        │
+   6  Quality gate           refuse if the post-fit residual is > 2 px
+        │
+   7  Refusal-retry          re-search with the refused sky region excluded and
+        │                    significance-aware stopping (only if step 6 refused)
+        ▼
+   attitude quaternion
+```
 
-2. **Diagnosed a non-obvious failure mode.** Initial linear pinhole geometry hid a
-   200–1000″ residual at the field corners (TESS uses a 6th-order SIP polynomial for
-   its 12° FOV). The oracle-correspondence `--use-gt` benchmark looked excellent
-   (4.6″ median) but
-   the catalog-based end-to-end pipeline silently failed on every image. The fix was
-   to apply SIP correction via `astropy.wcs.sip_pix2foc` before the projection — a
-   small change with a large effect.
+The neural network only does step 1. Everything after it is geometry that can be
+checked, which is why a wrong identification cannot slip through quietly.
 
-3. **Two-pass refinement.** RANSAC Wahba lock + scipy plate-solve. The first finds a
-   rough constellation; the second turns that into sub-pixel attitude by minimizing
-   pixel residuals through the SIP forward projection.
+---
 
-4. **A quality gate.** Wrong locks fail loudly rather than silently. Production star
-   trackers can't return wildly wrong attitudes; this pipeline refuses to answer
-   when the post-solve median Euclidean per-star residual exceeds 2 px.
+## Engineering highlights
 
-5. **Interactive walkthrough.** Streamlit app runs every stage live with real numbers,
-   not just plots.
+**1. Learned detection improves accuracy through centroid precision.** With everything
+else held fixed and true star matches supplied, swapping the classical peak finder for
+the U-Net improves the attitude error from 6.0″ to **4.6″ (23% better)**. The gain comes
+from more precise star positions, not from finding more stars.
+
+![Classical vs U-Net detection](docs/images/detection_classical_vs_unet.png)
+
+**2. Found and fixed a failure mode that only appears on real data.** At first, 7 of
+the 248 frames were refused. In every case the search had locked onto a false pattern
+in Carina, the densest part of the Milky Way, where random stars line up by chance.
+The quality gate caught all 7 (residuals of 9–12 px against 0.1–0.2 px for correct
+answers), so no wrong attitude was returned. Diagnosis showed that the true answer would
+have scored *more* matches. The search had stopped too early because it counted raw
+matches. The fix compares each candidate with the number of matches expected by chance
+in that part of the sky: every correct lock is at least 7.4× above chance, and every
+false one is at most 3.6×. With a 5× threshold, **all 7 frames are recovered** at the
+first retry with normal accuracy (0.13–0.17 px residual).
+
+![Raw match count vs significance](docs/images/significance_gap.png)
+
+**3. Lens distortion matters at the edge of a 12° field.** A plain pinhole model hid
+200–1000″ residuals at the field corners, because TESS needs a 6th-order SIP distortion
+polynomial. With known star matches the error looked fine (4.6″), but the blind
+pipeline failed on every image. Applying the SIP correction before projection fixed it.
+
+**4. 27× faster star identification, identical results.** Profiling showed that almost
+all the time went into searching the catalogue for the third star of each triangle, not
+into the neural network. Restricting that search to precomputed neighbour lists cut the
+median frame time from 211 s to **9.4 s**. All 248 frames return the same attitude, the
+same number of iterations and the same number of attempts as before.
+
+![Runtime before and after](docs/images/speedup.png)
+
+**5. Tested the textbook extra check and reported what it actually did.** The classic
+Pyramid 4th-star check changed nothing on clean frames (117–118 / 120 in every
+variant), and the textbook version would have vetoed 69% of true triangles. It only
+helps when many false stars are injected (+12 frames at +0.5× contamination), and
+it never prevents a false lock that the residual gate would not already catch.
+
+---
+
+## Detector comparison
+
+Centroid quality with known star matches (`--use-gt` protocol, 120 test images):
+
+| Detector | Parameters | Median attitude error |
+|---|---:|---:|
+| Classical peak finding | n/a | 6.0″ |
+| **U-Net** (used in the pipeline) | 7.76 M | **4.6″** |
+| HRNet | 3.99 M | 4.8″ |
+
+HRNet comes within 0.2″ of the U-Net with half the parameters, which suggests that
+detector architecture is not the main accuracy bottleneck.
 
 ---
 
@@ -138,10 +158,9 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 python3 -m pip install -r requirements.txt
 ```
 
-> **First-run expectations.** The first invocation builds and caches a Hipparcos
-> pair-angle database (~60–90 s). RANSAC convergence is image-dependent:
-> easy images finish in seconds, while harder fields can take several minutes.
-> Replay mode avoids this wait and is the recommended way to explore the demo.
+> **First run.** The first call builds and caches the Hipparcos pair-angle database
+> and the neighbour lists (about 1–2 minutes). After that a frame typically takes
+> seconds on a laptop CPU. Replay mode in the demo skips the search entirely.
 
 ### Interactive Streamlit walkthrough
 
@@ -149,26 +168,26 @@ python3 -m pip install -r requirements.txt
 streamlit run Code/Streamlit_app/pipeline_app.py
 ```
 
-Opens at <http://localhost:8501>. Pick one of the 16 demo TESS images in the
-sidebar and press *Run pipeline*. Each stage materialises with the actual body
-vectors, triangle-angle table, plate-solve iterations, and a final pose
-comparison against the ground truth.
+Opens at <http://localhost:8501>. Pick one of the 16 bundled TESS images and press
+*Run pipeline*. Every stage shows its real intermediate values: body vectors, the
+triangle-angle table, plate-solve iterations, and the final attitude compared with
+the reference.
 
-### End-to-end batch evaluation
+### End-to-end batch run
 
 ```bash
 python3 Code/Star_ID/inference_full.py \
     --data-dir Data/dataset_tess_test \
     --model    Results/unet_run3/best_model.pt \
     --catalog  Data/hybrid/catalog_hipparcos_full.csv \
-    --mag-limit 7.5 \
     --out-dir  Results/star_id_run
 ```
 
-Writes per-image JSON artefacts to `--out-dir` and prints a summary table
-(solve rate, median / 90th-pct / max error) to stdout.
+This writes one JSON file per image and prints the solve rate and error statistics.
+On the bundled 16-frame demo set it solves **16 / 16**, median **6.93″**, with
+0 false locks. `--retries 0` turns off the refusal-retry.
 
-### Generate the visualisations
+### Visualisations
 
 ```bash
 python3 Code/Star_ID/visualize_inference.py \
@@ -177,8 +196,15 @@ python3 Code/Star_ID/visualize_inference.py \
     --out-dir  Results/star_id_run/viz
 ```
 
-Produces per-image overlays (detections + projected catalog + match lines),
-per-star residual maps, and a project summary chart.
+### Tests
+
+```bash
+python3 -m pytest -q
+```
+
+The tests cover the attitude geometry (including a check that every pose parameter
+moves the sky exactly as the scored rotation says), the published result tables, and
+the Streamlit replay. They run on every push in GitHub Actions.
 
 ---
 
@@ -186,16 +212,15 @@ per-star residual maps, and a project summary chart.
 
 ```
 star-tracker/
-├── README.md              ← this file
-├── PROJECT_DESCRIPTION.md ← longer technical write-up
-├── RESULTS.md             ← detailed results tables
-├── requirements.txt
+├── README.md                ← this file
+├── RESULTS.md               ← detailed result tables
+├── PROJECT_DESCRIPTION.md   ← longer technical write-up
 ├── Code/
 │   ├── Star_ID/
-│   │   ├── inference_full.py       ← main lost-in-space pipeline
-│   │   ├── triangle_id.py          ← RANSAC star identification
-│   │   ├── normalize_result_conventions.py
-│   │   ├── summarize_results.py       ← auditable result-table export
+│   │   ├── inference_full.py       ← full lost-in-space pipeline + refusal-retry
+│   │   ├── triangle_id.py          ← RANSAC star identification (neighbour-list search)
+│   │   ├── summarize_results.py    ← per-frame tables + metrics from run artefacts
+│   │   ├── make_results_figure.py  ← docs/images/results.png from the tables
 │   │   ├── visualize_inference.py  ← per-image diagnostic plots
 │   │   └── visualize_pipeline.py   ← 6-panel pipeline trace
 │   ├── Model_train_code/train.py   ← U-Net architecture + training
@@ -203,59 +228,61 @@ star-tracker/
 │   ├── Tess_Dataset/process_tess.py ← FITS → PNG + JSON labels (with SIP WCS)
 │   └── Streamlit_app/pipeline_app.py
 ├── Data/
-│   ├── dataset_tess_test/  ← 16 TESS demo images + labels (28 MB)
-│   └── hybrid/             ← Hipparcos catalog (5 MB)
-└── Results/
-    ├── full_test_metrics.json       ← aggregate 120-frame summary
-    ├── full_test_per_frame.csv      ← one auditable row per frame
-    └── unet_run3/best_model.pt      ← trained U-Net weights (30 MB)
+│   ├── dataset_tess_test/  ← 16 TESS demo images + labels
+│   └── hybrid/             ← Hipparcos catalogue
+├── Results/
+│   ├── full_test_per_frame.csv / full_test_metrics.json          ← 120 test frames
+│   ├── unseen_sectors_per_frame.csv / unseen_sectors_metrics.json ← 128 unseen-sector frames
+│   ├── star_id_run/                ← demo-set artefacts used by Replay mode
+│   └── unet_run3/best_model.pt     ← trained U-Net weights (30 MB)
+└── tests/
 ```
 
-The trained HRNet weights, full 800-image training set, and FITS archives live with the
-research project; this repo carries only what's needed for the demo and to read the code.
+The full 800-image dataset, the FITS archives and the HRNet weights stay with the
+research project. This repository carries what is needed to run the demo, read the
+code and audit the published numbers.
 
 ---
 
 ## Tech stack
 
-**Languages & ML:** Python, PyTorch (U-Net + HRNet, heatmap regression), NumPy, SciPy
-(SVD + nonlinear least-squares).
-**Astronomy / geometry:** Astropy (FITS, WCS, SIP polynomial), gnomonic projection,
-quaternion algebra.
-**Algorithms:** RANSAC, Wahba's problem, chirality-filtered triangle matching,
-two-pass plate-solving.
-**Tooling:** Streamlit (interactive demo), Matplotlib (visualisations), SLURM (training).
+**ML:** PyTorch (U-Net and HRNet heatmap regression, weighted-MSE loss, sub-pixel
+centroiding). **Geometry:** NumPy, SciPy (SVD, nonlinear least squares), quaternions,
+gnomonic projection. **Astronomy:** Astropy (FITS, WCS, SIP distortion), Hipparcos
+catalogue. **Algorithms:** RANSAC, Wahba's problem, triangle matching with chirality
+check, significance-aware stopping. **Tooling:** Streamlit, Matplotlib, pytest, GitHub
+Actions, SLURM GPU cluster.
 
 ---
 
-## Limitations and honest caveats
+## Limitations
 
-- **Calibration source.** The evaluation reads SIP, CRPIX, and CD from each TESS
-  WCS, then explicitly factors the rotational component out of CD. A flight
-  implementation would estimate and store one stable intrinsic calibration per CCD.
-- **Residual calibration error.** Remaining corner-dependent distortion limits the
-  corrected full-test median to 8.98″. A dedicated per-CCD residual map is the next
-  accuracy lever.
-- **Variable CPU latency.** Pair-angle lookup, vectorized third-star search, and
-  FOV-cone verification are implemented, but RANSAC convergence still varies from
-  seconds to several minutes depending on the field.
-- **Honest abstention.** Three of 107 valid full-test frames were refused by the
-  quality gate. All 104 published solutions remain below one arcminute.
+- **Reference attitude.** The reference comes from the WCS solution of the same TESS
+  image, which is very accurate but not fully independent. The pipeline reads only the
+  camera calibration from it (SIP, CRPIX and the attitude-free part of CD).
+- **One camera.** TESS is a survey telescope, not a flight star tracker: 12° field,
+  long exposures, 21″ pixels. Results on a real star-tracker camera are future work.
+- **The retry rule was designed after seeing the failures.** The 5× significance
+  threshold sits in the gap between all 241 correct locks (≥ 7.4×) and all 7 false
+  ones (≤ 3.6×). It runs only after the gate refuses, so it cannot change any frame
+  solved at the first attempt.
+- **Roll is the weak axis.** A single 12° frame pins the pointing to about 3″, but
+  rotation about the boresight to only about 7″.
+- **Runtime.** 9.4 s per frame on a desktop GPU + CPU is fine for research but slow
+  for a flight tracker (which runs at several Hz on embedded hardware).
 
 ---
 
 ## Acknowledgements
 
-NASA TESS mission for the public TICA Full-Frame-Image data. The Hipparcos catalog
-team for the reference star positions used in catalog matching.
-
----
+NASA's TESS mission and the TICA team for the public full-frame images. ESA's Hipparcos
+mission for the reference star catalogue.
 
 ## Author
 
-Temur Kuchkorov · Master's thesis project, 2025–2026.
+**Temur Kuchkorov**, Master's thesis project, 2025–2026.
 [Email](mailto:timka02qochqorov@gmail.com) · [LinkedIn](https://www.linkedin.com/in/temurkuchkorov/)
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).

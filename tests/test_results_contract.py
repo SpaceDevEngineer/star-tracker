@@ -14,35 +14,36 @@ def test_bundled_replay_set_is_complete_and_reproducible():
     assert len(files) == 16
 
     rows = [json.loads(path.read_text()) for path in files]
-    solved = [row for row in rows if not row.get("failed")]
-    failed = [row for row in rows if row.get("failed")]
-
-    assert len(solved) == 15
-    assert len(failed) == 1
-    assert failed[0]["reason"].startswith("quality_gate:")
-    assert failed[0]["angular_error_arcsec_if_kept"] > 100_000
-
+    assert not any(row.get("failed") for row in rows)
     assert all(row["attitude_convention"] == "physical_body_roll_deg" for row in rows)
     assert all(row["residual_metric"] == "median_euclidean_px" for row in rows)
+    assert all(row["median_px_residual"] < 2.0 for row in rows)
 
-    errors = np.array([row["angular_error_arcsec"] for row in solved])
-    assert np.median(errors) == pytest.approx(6.6297, abs=5e-4)
+    errors = np.array([row["angular_error_arcsec"] for row in rows])
+    assert np.median(errors) == pytest.approx(6.9253, abs=5e-4)
+    assert errors.max() < 60.0
 
 
-def test_full_evaluation_summary_has_auditable_counts():
-    summary = json.loads(
-        (ROOT / "Results" / "full_test_metrics.json").read_text()
-    )
-    counts = summary["counts"]
-    assert counts["total_frames"] == 120
-    assert counts["valid_frames"] == 107
-    assert counts["solved_frames"] == 104
-    assert counts["algorithm_refusals"] == 3
-    assert counts["solved_frames"] + counts["algorithm_refusals"] == counts["valid_frames"]
+@pytest.mark.parametrize("name, total, first_attempt, median", [
+    ("full_test", 120, 117, 7.788),
+    ("unseen_sectors", 128, 124, 7.334),
+])
+def test_published_tables_match_their_metrics(name, total, first_attempt, median):
+    metrics = json.loads((ROOT / "Results" / f"{name}_metrics.json").read_text())
+    counts = metrics["counts"]
+    assert counts["total_frames"] == total
+    assert counts["solved_frames"] == total
+    assert counts["algorithm_refusals"] == 0
+    assert counts["false_locks"] == 0
+    assert counts["solved_first_attempt"] == first_attempt
+    assert counts["recovered_by_retry"] == total - first_attempt
+    assert metrics["attitude_error_arcsec"]["median"] == pytest.approx(median, abs=1e-3)
 
-    with open(ROOT / "Results" / "full_test_per_frame.csv", newline="") as csv_file:
+    with open(ROOT / "Results" / f"{name}_per_frame.csv", newline="") as csv_file:
         rows = list(csv.DictReader(csv_file))
-    assert len(rows) == counts["total_frames"]
+    assert len(rows) == total
     assert sum(row["status"] == "solved" for row in rows) == counts["solved_frames"]
-    assert sum(row["status"] == "algorithm_refusal" for row in rows) == counts["algorithm_refusals"]
-    assert sum(row["status"] == "data_excluded" for row in rows) == counts["missing_wcs_frames"]
+    assert sum(int(row["attempts"]) > 1 for row in rows) == counts["recovered_by_retry"]
+    errors = np.array([float(row["attitude_error_arcsec"]) for row in rows])
+    assert np.median(errors) == pytest.approx(median, abs=1e-3)
+    assert int(np.sum(errors < 20.57)) == metrics["threshold_counts"]["subpixel_below_20_57_arcsec"]

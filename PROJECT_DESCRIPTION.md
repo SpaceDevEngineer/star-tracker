@@ -1,52 +1,71 @@
-# Deep-Learning-Based Star Tracker — Spacecraft Attitude Determination
+# Deep-Learning Star Tracker: Spacecraft Attitude from Real Satellite Imagery
 
-*Master's Thesis Project, 2025–2026*
-
----
-
-## One-line summary (CV project entry)
-
-**Deep Learning Star Tracker — Spacecraft Attitude Determination from Real Satellite Imagery**
-
-Built an end-to-end "lost-in-space" attitude determination pipeline that recovers a
-spacecraft's 3-axis orientation from a single raw star-field image, achieving sub-pixel
-accuracy (median 8.98″ ≈ 0.44 px) on real TESS satellite data. Combined a CNN star
-detector (U-Net / HRNet) with RANSAC triangle star identification, Wahba SVD, and
-nonlinear plate-solve refinement.
+*Master's thesis project, 2025–2026*
 
 ---
 
-## Portfolio description
+## One-line summary (CV entry)
 
-**Deep-Learning-Based Star Tracker for Spacecraft Attitude Determination**
+Built a lost-in-space star tracker that recovers a spacecraft's 3-axis attitude from a
+single image of real NASA TESS data. It solved **248 of 248 frames with zero wrong
+answers**, at a median error of **7.8″ (0.38 px)**, and kept the same accuracy on 8
+unseen sky sectors. The design pairs a U-Net star detector with RANSAC triangle
+identification, Wahba's SVD solver and nonlinear plate solving.
 
-Designed and implemented a complete star-tracker pipeline that determines a spacecraft's
-orientation (attitude quaternion) from a single image of the star field, with no prior
-knowledge of pointing direction ("lost-in-space" mode). Validated on **real TESS
-satellite imagery** (NASA's Transiting Exoplanet Survey Satellite), not simulations.
+## Short portfolio description
 
-Pipeline: raw FITS image → CNN star detection → camera-frame body vectors → RANSAC
-triangle identification against the Hipparcos star catalog → Wahba's problem (SVD) →
-iterative plate-solve refinement → attitude quaternion.
+A star tracker finds a spacecraft's orientation by photographing the stars and
+recognising them. I built the complete pipeline: a U-Net that detects stars with
+sub-pixel precision, triangle-pattern matching against the Hipparcos catalogue with
+RANSAC, attitude from Wahba's problem, plate-solve refinement, and a quality gate that
+refuses instead of guessing. On 248 real images taken in orbit by NASA's TESS
+satellite, every frame was solved with zero wrong answers, at a median error of about
+a third of a pixel. Along the way I diagnosed a rare failure mode in the dense Milky
+Way and fixed it with a statistical stopping rule, and made the identification step
+27× faster with bit-identical results.
 
-Key contributions:
+---
 
-- Trained and compared two CNN architectures (U-Net, 7.7M params; HRNet, 4.0M params)
-  for star centroid detection via heatmap regression — observed a 0.2″ median gap
-  while HRNet used roughly half the model size; formal equivalence testing remains
-  future work.
-- Diagnosed a critical geometric failure: wide-FOV TESS optics introduce 6th-order SIP
-  polynomial distortion that a naïve pinhole projection cannot model (200–1000″ errors
-  at frame corners). Re-architected the geometry layer around SIP-corrected body vectors.
-- Implemented a two-pass refinement: RANSAC triangle lock → nonlinear least-squares
-  plate-solve over (RA, Dec, roll) → sub-pixel attitude.
-- Added a quality gate that rejects false constellation locks, converting silent
-  catastrophic errors into honest "no-solution" returns.
-- Built diagnostic visualizations and an interactive Streamlit walkthrough of every
-  pipeline stage.
+## Key contributions
 
-Result: 104/107 valid frames solved (97.2%), 0 false locks, **median attitude error
-8.98″ (~0.44 px at 20.57″/px plate scale)** in full lost-in-space mode.
+- **End-to-end pipeline on real data.** TESS FITS → background-subtracted PNG and labels
+  → U-Net heatmap detection → SIP-corrected body vectors → RANSAC triangle
+  identification → Wahba SVD → plate solve → quality gate → refusal-retry → quaternion.
+- **Learned detection that measurably helps.** With known star matches, the U-Net
+  improves attitude error over classical peak finding from 6.0″ to 4.6″ (23%), through
+  centroid precision. HRNet comes within 0.2″ with half the parameters.
+- **Root-caused a real-world optics failure.** TESS's 12° field needs a 6th-order SIP
+  distortion model. A pinhole model left 200–1000″ residuals at the corners and made
+  blind identification fail on every frame. Rebuilt the geometry around SIP-corrected
+  vectors.
+- **Diagnosed and fixed the only remaining failure mode.** 7 of 248 frames locked onto
+  a chance pattern in Carina, the densest bright-star field in the sky. The quality
+  gate refused all 7, so none were wrong. Showed that raw match counts overlap between
+  true and false locks but significance (matches / matches expected by chance) does
+  not (≥ 7.4× vs ≤ 3.6×), and added a significance-aware retry that recovers all 7.
+- **Performance engineering.** Profiled the pipeline, found that the third-star
+  catalogue search dominated, and replaced it with precomputed neighbour lists: the
+  median frame time went from 211 s to 9.4 s, with identical results on all 248 frames.
+- **Honest evaluation.** Targets fixed before the final runs (≥ 95% solved, < 1 px, 0 false locks), a
+  generalisation test on 8 unseen sectors, Wilson confidence intervals, an ablation of
+  the textbook Pyramid check (inert on clean data), and per-frame result tables in the
+  repository.
+- **Reproducible software.** Unit tests that tie the scored attitude error to WCS
+  geometry, result-table contract tests, Streamlit replay tests, GitHub Actions CI, and
+  an interactive demo of every pipeline stage.
+
+## Results
+
+| | Test split | Unseen sectors |
+|---|---:|---:|
+| Solved | 120 / 120 | 128 / 128 |
+| False locks | 0 | 0 |
+| Median error | 7.79″ (0.38 px) | 7.33″ (0.36 px) |
+| 90th percentile / worst | 13.87″ / 20.39″ | 15.02″ / 25.35″ |
+| Below one pixel | 120 / 120 | 125 / 128 |
+| Median pointing / roll | 2.78″ / 7.10″ | 2.61″ / 6.50″ |
+
+Typical frame time: 9.4 s (U-Net on GPU, star identification on CPU).
 
 ---
 
@@ -54,91 +73,67 @@ Result: 104/107 valid frames solved (97.2%), 0 false locks, **median attitude er
 
 ### Problem
 
-A star tracker is a spacecraft sensor that determines orientation by photographing stars
-and matching them to a catalog. The "lost-in-space" problem — recovering attitude with
-zero prior information — is the hardest case. This thesis tackled it on **real TESS
-satellite images** rather than synthetic data.
+A star tracker determines attitude by matching imaged stars against a catalogue. The
+*lost-in-space* case, with no prior pointing knowledge, is the hardest. Most published
+learning-based trackers are evaluated on simulated star fields and report detection
+metrics. This project evaluates the final attitude on real images taken in orbit, with
+real noise, stray light, saturated stars and lens distortion.
 
 ### Approach
 
-1. **Data pipeline** — Converted ~800 TESS TICA Full-Frame-Image FITS files
-   (sectors 27–101) into a training dataset: background-subtracted 8-bit PNGs,
-   512×512 non-overlapping tiles, JSON labels with star positions, Hipparcos catalog
-   matches, and the full WCS solution including SIP distortion coefficients.
+1. **Data.** About 800 TESS TICA full-frame images from sectors 27–101 were converted
+   into background-subtracted 8-bit PNGs with JSON labels: star positions matched to
+   Hipparcos and the full WCS solution including SIP distortion. The split is 70/15/15
+   by image, and 8 further sectors are held out as an unseen-sky test.
+2. **Star detection.** A U-Net (7.76 M parameters) regresses a Gaussian heatmap per
+   star on 512×512 tiles, trained with weighted MSE (star pixels × 20) and selected by
+   validation F1 (0.636 at threshold 0.55). Centroids come from intensity-weighted
+   connected components.
+3. **Camera geometry.** Pixel centroids are mapped to body unit vectors with the SIP
+   distortion removed (`astropy.wcs.sip_pix2foc`) and a gnomonic projection. Only camera
+   calibration (SIP, CRPIX and the attitude-free scale/shear part of the CD matrix) is
+   read from the label. The attitude, including roll, comes from the blind solution.
+4. **Star identification.** RANSAC over triangles of the 60 brightest detections,
+   matched against a Hipparcos pair-angle database (V < 7.5) with a chirality check. A
+   3-star Wahba solution is verified against all detections, and the third catalogue
+   star is searched only among precomputed neighbours.
+5. **Refinement.** Wahba refit on every verified star, then nonlinear least squares over
+   (RA, Dec, roll) in pixel space through the SIP forward model, with match tolerances
+   tightened from 30 px to 5 px to 1.5 px.
+6. **Reliability.** A quality gate refuses any solution whose median post-fit residual
+   exceeds 2 px. After a refusal, the search is repeated with the refused sky region
+   excluded and early stopping allowed only for candidates at least 5× above the
+   chance-match level of their sky region.
 
-2. **Star detection (deep learning)** — Trained CNNs for heatmap regression: each star
-   rendered as a Gaussian blob; the model predicts a per-pixel probability map.
-   Weighted-MSE loss (star pixels ×20), cosine LR schedule, best checkpoint selected by
-   detection F1. Compared **U-Net** (7.76M parameters) and **HRNet** (3.99M parameters)
-   under identical training conditions.
+### Lessons
 
-3. **Camera geometry** — Converted detected pixel centroids to 3-D body unit vectors.
-   Identified that linear pinhole projection fails on TESS's 12° field of view due to
-   optical distortion; replaced it with **SIP-polynomial-corrected gnomonic projection**,
-   making body-vector angles consistent with catalog angles. Explicitly factored the
-   rotational part out of the FITS CD matrix and initialized physical roll from the
-   blind RANSAC/Wahba rotation rather than from ground-truth WCS orientation.
-
-4. **Star identification** — RANSAC-based triangle matching: random detection triplets
-   matched against a pre-computed Hipparcos pair-angle database (5.3M pairs,
-   binary-search lookup), with chirality filtering to reject mirror solutions, then
-   Wahba SVD for a candidate rotation, verified against all detections.
-
-5. **Attitude refinement** — Two-pass plate-solve: rough Wahba rotation → synthesize a
-   candidate WCS → re-project the full catalog → snap matches at tightening pixel
-   tolerances (30→5→1.5 px) → nonlinear least-squares fit of (RA, Dec, roll) minimizing
-   pixel residuals.
-
-6. **Reliability** — A quality gate on the post-solve pixel residual rejects
-   self-consistent-but-wrong constellation locks.
-
-### Results
-
-Real TESS test imagery, lost-in-space mode, no ground-truth hints:
-
-| Metric | Value |
-|---|---|
-| Valid evaluation frames | 107 / 120 (13 lack WCS calibration) |
-| Attitude solve rate | 97.2% (104/107), 0 false locks |
-| Median attitude error | 8.98″ (0.44 px) |
-| 90th percentile | 19.41″ (0.94 px) |
-| Cross-boresight / roll median | 2.74″ / 8.33″ |
-| Centroid-limited benchmark (U-Net / HRNet) | 4.6″ / 4.8″ median |
-| Best single image | 1.10″ (0.05 px) |
-
-The small observed detector gap suggests that architecture is not the dominant
-accuracy bottleneck. Residual optical distortion is the stronger limitation,
-identifying camera factory-calibration as the path to sub-arcsecond accuracy.
+- Detection F1 is a misleading proxy: the classical detector scores F1 = 0.10 yet gives
+  usable attitudes, because its "false positives" are mostly real faint stars. The
+  end-to-end attitude error is the honest metric.
+- On real data the hard cases are statistical (dense sky regions), not algorithmic.
+  Comparing against chance is what separates true from false locks.
+- Roll about the boresight is the weakly observable axis for a single frame: about 7″,
+  against about 3″ for pointing.
 
 ---
 
 ## Technologies
 
-**Languages & ML:** Python, PyTorch (CNN architecture design, training), NumPy,
-SciPy (SVD, nonlinear least-squares optimization)
-
-**Domain libraries:** Astropy (WCS, SIP distortion, FITS), Pandas, Matplotlib, Streamlit
-
-**Computer vision:** heatmap regression, CNN encoder-decoder architectures
-(U-Net, HRNet), sub-pixel centroid extraction
-
-**Algorithms:** RANSAC, Wahba's problem / SVD attitude solver, gnomonic projection,
-plate-solving, quaternion mathematics
-
-**Astronomy / aerospace:** star tracker design, ICRS coordinate frames, attitude
-determination, Hipparcos catalog, TESS mission data
-
-**Infrastructure:** SLURM cluster, NVIDIA RTX 2080 Ti GPU training, Git, Linux
-
----
+**ML:** Python, PyTorch (U-Net, HRNet, heatmap regression), NumPy, SciPy.
+**Astronomy / aerospace:** Astropy (FITS, WCS, SIP), Hipparcos, ICRS frames,
+quaternions, attitude determination, TESS mission data.
+**Algorithms:** RANSAC, Wahba's problem / SVD, gnomonic projection, plate solving,
+nonlinear least squares, significance testing.
+**Engineering:** pytest, GitHub Actions, Streamlit, Matplotlib, SLURM GPU cluster
+(RTX 2080 Ti), profiling and performance optimisation, Git, Linux.
 
 ## Skills demonstrated
 
-- End-to-end ML system design (data pipeline → model → classical post-processing → evaluation)
-- Deep learning: CNN architecture comparison, heatmap-regression training, hyperparameter tuning
-- Classical computer vision & numerical methods: RANSAC, SVD, nonlinear optimization
-- Root-cause debugging of a complex multi-stage system (diagnosed an optical-distortion
-  failure invisible in synthetic benchmarks)
-- Working with real, noisy scientific data rather than simulations
-- Scientific software engineering and reproducible experiments
-- Building diagnostic tooling and interactive demos
+- End-to-end ML system design: data pipeline, model, classical post-processing,
+  evaluation
+- Deep learning for precise localisation (sub-pixel heatmap regression)
+- Classical computer vision and numerical methods: RANSAC, SVD, nonlinear optimisation
+- Root-cause analysis of failures in a multi-stage system on real, noisy data
+- Performance engineering with verified output equivalence
+- Rigorous, honest evaluation: generalisation tests, ablations, confidence intervals
+- Scientific software engineering: tests, CI, reproducible result tables, interactive demo

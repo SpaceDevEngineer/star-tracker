@@ -30,3 +30,6 @@ Results/star_id_run/*
 
 # Streamlit local config
 .streamlit/secrets.toml
+
+# Neighbour lists for the fast third-star search (rebuilt on first run)
+Data/hybrid/neighbours_*.npz

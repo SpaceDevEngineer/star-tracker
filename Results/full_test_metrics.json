@@ -1,37 +1,59 @@
 {
-  "evaluation": "full lost-in-space TESS test split",
-  "attitude_convention": "body-to-ICRS; physical roll about body +x; physical_roll_deg = (180 - CD_angle_deg) mod 360",
-  "calibration": "SIP + CRPIX + de-rotated per-CCD CD scale/shear",
+  "evaluation": "lost-in-space TESS attitude, test set, final pipeline (first attempt + refusal-retry)",
+  "attitude_error": "angle of R_gt^T R_pred (body-to-ICRS); cross-boresight = |(y, z)| and roll = |x| of its rotation vector",
+  "false_lock_definition": "wrong star identification: cross-boresight error > 60 arcsec",
   "counts": {
     "total_frames": 120,
-    "missing_wcs_frames": 13,
-    "valid_frames": 107,
-    "solved_frames": 104,
-    "algorithm_refusals": 3,
-    "false_locks": 0
+    "data_excluded": 0,
+    "solved_frames": 120,
+    "algorithm_refusals": 0,
+    "false_locks": 0,
+    "solved_first_attempt": 117,
+    "recovered_by_retry": 3
   },
-  "solve_rate_valid_percent": 97.19626168224299,
+  "solve_rate_percent": 100.0,
+  "solve_rate_wilson95_percent": [
+    96.89797289440706,
+    100.0
+  ],
   "attitude_error_arcsec": {
-    "median": 8.975795770363124,
-    "mean": 10.74938483118987,
-    "p90": 19.411211984597518,
-    "p95": 22.150997656024128,
-    "min": 1.1025905643481504,
-    "max": 42.512272668824345
+    "median": 7.78795,
+    "mean": 8.5549775,
+    "p90": 13.86932,
+    "p95": 17.99685,
+    "min": 1.0235,
+    "max": 20.3945
   },
+  "attitude_error_px_median": 0.37860719494409334,
   "axis_error_arcsec": {
-    "cross_boresight_median": 2.737317859422996,
-    "cross_boresight_p90": 4.854185992677846,
-    "roll_median": 8.325116757781274,
-    "roll_p90": 19.26947228388859
+    "cross_boresight_median": 2.77705,
+    "cross_boresight_p90": 5.038320000000001,
+    "roll_median": 7.0973500000000005,
+    "roll_p90": 13.698180000000002
   },
   "threshold_counts": {
-    "subpixel_below_20_57_arcsec": 95,
-    "below_60_arcsec": 104
+    "subpixel_below_20_57_arcsec": 120,
+    "below_60_arcsec": 120
+  },
+  "first_attempt_attitude_error_arcsec": {
+    "median": 7.716940948968912,
+    "mean": 8.592490539194188,
+    "p90": 13.878396257069145,
+    "p95": 18.08246494436429,
+    "min": 1.0235354776612424,
+    "max": 20.394453364644537
+  },
+  "frame_time_gpu_s": {
+    "median": 8.603,
+    "mean": 16.596733333333333,
+    "p90": 32.796800000000026,
+    "p95": 49.104049999999994,
+    "min": 1.836,
+    "max": 226.406
   },
   "provenance": {
     "source_artifacts": "120 per-frame JSON files from the thesis evaluation run",
-    "normalization": "Legacy stored CD-angle poses were converted to physical body roll before recomputing quaternion errors",
-    "generated_utc": "2026-07-28"
+    "check": "errors equal the rigid rotation between predicted and reference WCS sky grids (tests/test_core_geometry.py)",
+    "generated": "2026-10-20"
   }
 }

@@ -1,174 +1,195 @@
 # Detailed Results
 
-End-to-end lost-in-space attitude determination on real TESS imagery, no `--use-gt`
-hints, no initial pose, no IMU prior. All attitude errors use physical body roll
-about camera +x, not the FITS CD-matrix angle.
+End-to-end lost-in-space attitude determination on real NASA TESS images: no initial
+pose, no IMU prior, no supplied star correspondences. The attitude error is the angle
+of R_gtᵀ R_pred between the returned body-to-ICRS rotation and the reference from the
+image's own WCS solution. The cross-boresight (pointing) and roll parts are the (y, z)
+and x components of that rotation's rotation vector. One pixel is 20.57″.
 
-## Full evaluation — 120 real TESS frames
+## 1. Final pipeline: 248 frames
 
-The held-out evaluation contains 120 frames across multiple TESS sectors. Thirteen
-labels lack WCS camera calibration and are excluded as unsolvable data failures.
-The remaining 107 frames are the algorithm denominator.
+The held-out **test split** has 120 frames (70/15/15 split by image, seed 42). The
+**unseen sectors** are 128 frames from 8 TESS sectors (16 frames each) that were never
+used for training or model selection.
+
+| Metric | Test split | Unseen sectors |
+|---|---:|---:|
+| Frames solved | **120 / 120** | **128 / 128** |
+| Solve rate, 95% Wilson interval | 96.9–100% | 97.1–100% |
+| Refusals | 0 | 0 |
+| False locks (wrong identification) | **0** | **0** |
+| Median attitude error | **7.79″ (0.379 px)** | **7.33″ (0.357 px)** |
+| Mean | 8.55″ | 8.69″ |
+| 90th / 95th percentile | 13.87″ / 18.00″ | 15.02″ / 18.04″ |
+| Best / worst frame | 1.02″ / 20.39″ | 1.62″ / 25.35″ |
+| Below one pixel (20.57″) | 120 / 120 | 125 / 128 |
+| Below one arcminute | 120 / 120 | 128 / 128 |
+| Cross-boresight median / p90 | 2.78″ / 5.04″ | 2.61″ / 4.78″ |
+| Roll median / p90 | 7.10″ / 13.70″ | 6.50″ / 14.71″ |
+| Solved at first attempt | 117 | 124 |
+| Recovered by the refusal-retry | 3 | 4 |
+| Frame time, median (GPU detection) | 8.6 s | 10.6 s |
+
+With 0 false locks in 248 frames, the 95% upper bound on the false-lock rate is below 1.5%.
+Per-sector medians on the unseen sectors range from 6.0″ to 9.6″, and every sector
+solves 16 of 16.
+
+Data: [`full_test_per_frame.csv`](Results/full_test_per_frame.csv),
+[`unseen_sectors_per_frame.csv`](Results/unseen_sectors_per_frame.csv) (one row per
+frame with status, total / pointing / roll error, attempts, matches, RANSAC iterations,
+residual and frame time), plus the matching `*_metrics.json`. They were generated from
+the evaluation-run artefacts with
+[`summarize_results.py`](Code/Star_ID/summarize_results.py).
+
+## 2. First attempt vs final pipeline
+
+The refusal-retry runs only after the quality gate refuses an answer, so frames solved
+at the first attempt are identical in both columns.
+
+| | First attempt | Final (with retry) |
+|---|---:|---:|
+| Test split solved | 117 / 120 (97.5%) | **120 / 120** |
+| Test median error | 7.72″ | 7.79″ |
+| Unseen sectors solved | 124 / 128 (96.9%) | **128 / 128** |
+| Unseen median error | 7.33″ | 7.33″ |
+| False locks | 0 | 0 |
+
+## 3. The seven refusals and how the retry fixed them
+
+At the first attempt, the triangle search on 7 of 248 frames locked onto a false
+pattern in Carina, the densest bright-star region of the southern Milky Way (190–200
+catalogue stars per half field, against a sky median of 64). The true fields of these
+frames were star-poor, so a correct triangle came up in only 3–15% of draws. Meanwhile
+the dense false region gathered 16–21 chance matches quickly, and the raw-count
+stopping rule ended the search early.
+
+The post-fit quality gate refused all seven, because the residuals were 9–12 px
+instead of the usual 0.1–0.2 px. So no wrong attitude was returned. The retry excludes
+the refused sky region (6° radius) and only stops early on a candidate that is at least
+5× above the number of matches expected by chance in its own sky region.
+
+| Frame | Refused lock (off by) | Gate residual | Retry: error | Retry: residual | Iterations | Significance |
+|---|---:|---:|---:|---:|---:|---:|
+| s0029 cam2 ccd2 | 116° | 11.9 px | 5.12″ | 0.12 px | 92 | 10.8× |
+| s0029 cam3 ccd1 | 150° | 10.2 px | 6.60″ | 0.15 px | 204 | 14.7× |
+| s0045 cam4 ccd1 *(test)* | 77° | 10.7 px | 9.68″ | 0.15 px | 40 | 9.0× |
+| s0084 cam1 ccd3 *(test)* | 160° | 11.0 px | 3.74″ | 0.17 px | 57 | 14.5× |
+| s0092 cam2 ccd2 | 165° | 11.5 px | 15.04″ | 0.14 px | 173 | 17.8× |
+| s0092 cam2 ccd4 | 118° | 10.2 px | 7.68″ | 0.14 px | 219 | 14.0× |
+| s0093 cam4 ccd1 *(test)* | 113° | 9.3 px | 7.86″ | 0.13 px | 203 | 8.1× |
+
+All 241 correct first-attempt locks are ≥ 7.4× above chance (median 14×), and all 7
+false locks are ≤ 3.6×. The 5× threshold sits in the empty gap between them. Every
+frame was recovered on the first retry.
+
+![Raw match count vs significance](docs/images/significance_gap.png)
+
+## 4. Runtime: 248 frames, before and after the search optimisation
+
+One node, 4 processes × 4 threads, Xeon Silver 4216 + RTX 2080 Ti. The optimisation
+restricts the third-star search to precomputed catalogue neighbour lists. Both runs
+return the same attitude, iterations and attempts on all 248 frames.
+
+| Stage, per frame | Before: median / mean / max | After: median / mean / max |
+|---|---:|---:|
+| Detection (U-Net, GPU) | 0.38 / 0.38 / 0.52 s | 0.40 / 0.43 / 0.59 s |
+| Star identification (CPU) | 210 / 388 / 3389 s | **7.8 / 14.2 / 126 s** |
+| Refinement + quality gate | 0.98 / 0.92 / 2.0 s | 1.1 / 1.2 / 2.7 s |
+| **Whole frame** | 211 / 446 / 6161 s | **9.4 / 17.9 / 226 s** |
+| Refusal-retry, extra (6 frames) | 2591 / 2364 / 3415 s | 91 / 82 / 127 s |
+
+The median per-frame speed-up of star identification is 27× (21–32× between the 10th
+and 90th percentile). The whole 248-frame evaluation dropped from 30.8 h to 1.2 h. On a
+CPU with four threads, the U-Net takes about 13 s per frame.
+
+![Runtime before and after](docs/images/speedup.png)
+
+## 5. Detector benchmark: known correspondences
+
+The `--use-gt` protocol supplies the true star matches, so only the detector's centroid
+noise affects the attitude. This isolates the deep-learning component from star
+identification.
+
+| Detector | Parameters | Solve rate | Median | 90th pct | Max |
+|---|---:|---:|---:|---:|---:|
+| Classical peak finding | n/a | 100% | 6.0″ | 11.4″ | n/a |
+| **U-Net** (run 3) | 7,762,465 | 100% | **4.6″** | **9.5″** | 13.5″ |
+| HRNet | 3,987,393 | 100% | 4.8″ | 9.7″ | 13.3″ |
+
+The U-Net is 23% more accurate than classical peak finding, because its centroids are
+more precise, not because it finds more stars. The classical detector returns
+thousands of peaks per image, many of them real stars too faint for the catalogue,
+so its detection F1 of 0.10 (vs 0.636 for the U-Net) understates it. End-to-end
+attitude error is the fair comparison.
+
+![Classical vs U-Net detection](docs/images/detection_classical_vs_unet.png)
+
+## 6. Pyramid 4th-star check: ablation
+
+The classic Mortari "Pyramid" check verifies a 4th star before accepting a triangle.
+It was implemented in two variants and run on identical frames and seeds (first attempt,
+test split):
+
+| Arm | Solved | Median | p90 | False locks |
+|---|---:|---:|---:|---:|
+| No check | 117 / 120 | 7.72″ | 13.88″ | 0 |
+| Hard check (textbook) | 118 / 120 | 7.79″ | 13.88″ | 0 |
+| Soft check (veto only on contradiction) | 117 / 120 | 7.72″ | 13.88″ | 0 |
+
+Under injected false-star contamination (same seeds across arms):
+
+| Contamination | No check | Hard check | Soft check | False locks (off / hard / soft) |
+|---|---:|---:|---:|---:|
+| +0.5× | 70 | **84** | 78 | 0 / 0 / 0 |
+| +1× | 20 | 27 | 21 | 3 / 3 / 2 |
+| +2× | 9 | 12 | 10 | 9 / 11 / 10 |
+
+On clean data the check is inert. The textbook version would have vetoed 575 of 836
+almost-certainly-true triangles, mostly because the 4th star is too faint for the
+catalogue. It helps under heavy contamination by saving search budget, but it never
+prevents a false lock that the post-fit residual gate would not already catch. It is
+off in the final pipeline.
+
+## 7. Bundled demo set: 16 TESS images
+
+The repository includes one complete TESS exposure (all 16 CCDs) so that the Streamlit
+Replay mode and the batch command work from a normal clone. The results below come from
+running the code in this repository on a laptop CPU.
 
 | Metric | Result |
 |---|---:|
-| Valid / total frames | 107 / 120 |
-| Correctly solved | **104 / 107 (97.2%)** |
-| Algorithm refusals | 3 |
-| False locks | **0** |
-| Median attitude error | **8.98″ (0.44 px)** |
-| 90th / 95th percentile | **19.41″ / 22.15″** |
-| Minimum / maximum | 1.10″ / 42.51″ |
-| Cross-boresight median / p90 | **2.74″ / 4.85″** |
-| Roll median / p90 | **8.33″ / 19.27″** |
-| Below one pixel (20.57″) | **95 / 104** |
-| Below one arcminute | **104 / 104** |
-
-The three refusals are counted against solve rate rather than silently removed.
-Machine-readable values and provenance are stored in
-[`Results/full_test_metrics.json`](Results/full_test_metrics.json); the status,
-error, match count, RANSAC iterations, and timing for every frame are in
-[`Results/full_test_per_frame.csv`](Results/full_test_per_frame.csv).
-
-### Attitude-convention correction
-
-Early artefacts used the FITS CD angle as the field named `roll`. With this camera
-axis convention (`pixel x → -body y`), physical roll is:
-
-```text
-physical_roll = (180° - CD_angle) mod 360°
-```
-
-The current pipeline factors CD rotation out of the camera calibration, initializes
-physical roll from the blind RANSAC/Wahba rotation, and applies the equation above
-only when converting legacy evaluation artefacts. Recomputing quaternion errors in
-the physical convention changed the full-test median from the previously quoted
-7.35″ to the corrected **8.98″**. Solve/refusal decisions and pixel-space fits are
-unchanged.
-
-## Bundled reproducible demo — 16 TESS images
-
-Test set: 16 NASA TESS TICA Full-Frame-Images (sector s1751), each 2136 × 2078 px,
-plate scale 20.57 arcsec/px. This compact subset is included so Replay and batch
-evaluation work from a normal Git clone.
-
-| Metric | Before fixes | **After SIP correction + plate-solve + quality gate** |
-|---|---|---|
-| Frames with sufficient detections | 16/16 | 16/16 |
-| Attitude solve rate | 0% (all `id_failed`) | **93.8% (15/16)** |
-| Median angular error | — | **6.63″ (0.32 px)** |
-| 90th percentile | — | 18.13″ (0.88 px) |
-| Max error (among solved) | — | 26.57″ (1.29 px) |
-| False locks | — | **0** (1 honest refusal) |
-| Best single image | — | 2.31″ (0.11 px) |
-
-### Per-image breakdown
+| Frames solved | **16 / 16** (no retry needed) |
+| False locks | 0 |
+| Median attitude error | **6.93″ (0.34 px)** |
+| 90th percentile / worst | 17.57″ / 27.01″ |
+| Best frame | 2.27″ (0.11 px) |
+| Below one pixel | 14 / 16 |
+| Median pointing / roll error | 3.11″ / 4.39″ |
 
 ```
-cam1/ccd1   4.88″       cam2/ccd1   26.57″      cam3/ccd1   14.68″      cam4/ccd1   4.88″
-cam1/ccd2  20.44″       cam2/ccd2    8.26″      cam3/ccd2   FAIL ✋     cam4/ccd2   8.40″
-cam1/ccd3   6.11″       cam2/ccd3    6.63″      cam3/ccd3    2.82″      cam4/ccd3   6.91″
-cam1/ccd4   6.34″       cam2/ccd4    2.31″      cam3/ccd4    2.45″      cam4/ccd4  12.97″
+cam1/ccd1   4.09″       cam2/ccd1   27.01″      cam3/ccd1   14.33″      cam4/ccd1    4.78″
+cam1/ccd2  20.82″       cam2/ccd2    7.14″      cam3/ccd2    8.46″      cam4/ccd2    7.02″
+cam1/ccd3   5.73″       cam2/ccd3    6.83″      cam3/ccd3    2.84″      cam4/ccd3    4.61″
+cam1/ccd4   8.06″       cam2/ccd4    2.27″      cam3/ccd4    2.51″      cam4/ccd4   11.11″
 ```
-
-14 of 15 solved frames are sub-pixel. `cam3/ccd2` is rejected via quality gate
-(median Euclidean residual 20.4 px,
-only 17 matches) — the pipeline honestly declined to emit a wrong attitude rather
-than reporting a 632 000″ false lock.
-
-![Summary](docs/images/summary.png)
-*Angular error per image (log scale, left), accuracy vs match count (centre),
-per-stage timing (right).*
-
-## Centroid-quality benchmark — 120 test images, `--use-gt` mode
-
-`--use-gt` synthesises reference vectors from the ground-truth quaternion so that
-only the detector's centroid noise contributes. This isolates the deep-learning
-model from the catalog-matching geometry.
-
-| Detector | Parameters | Solve rate | Median error | 90th pct | Max |
-|---|---:|---:|---:|---:|---:|
-| **U-Net**  (run 3) | 7,762,465 | 100% | **4.6″** | 9.5″ | 13.5″ |
-| **HRNet** (run 1) | 3,987,393 | 100% | **4.8″** | 9.7″ | 13.3″ |
-
-The observed median gap is only 0.2″ while HRNet uses roughly half the parameters.
-This makes HRNet a promising embedded alternative, but a paired bootstrap confidence
-interval is still required before claiming statistical equivalence.
 
 ![Example overlay](docs/images/example_overlay.png)
-*Red = U-Net detections, cyan = projected catalog after plate-solve, green lines
-= matched pairs. Final attitude error 4.88″.*
+*Red = U-Net detections, cyan = catalogue projected through the final attitude, green
+lines = matched pairs.*
 
-## Per-star residual distribution
+## 8. Models
 
-For a single image, residuals between observed pixel positions and catalog stars
-projected through the final attitude:
+| Model | Architecture | Params | Notes |
+|---|---|---:|---|
+| **U-Net** | 4-level encoder-decoder, skip connections | 7,762,465 | Run 3, best F1 = 0.636 at threshold 0.55 |
+| HRNet | Multi-resolution parallel branches | 3,987,393 | Same targets and training setup |
 
-![Residual map](docs/images/example_residuals.png)
-*Left: each matched star coloured by its pixel-space residual. Right: histogram
-of residuals across all 55 matches. Median residual = 4.79″, max 20.66″.*
+Training setup (shared by both models):
 
-Edge stars (top-left, bottom-right) carry slightly larger residuals — that's the
-remaining attitude-free SIP residual visible. Factory CD-shear calibration would
-reduce this further.
-
-## Timing — single image, single-thread CPU
-
-| Stage | Latency |
-|---|---|
-| U-Net detection (16 tiles) | ~0.5 s |
-| RANSAC triangle ID | seconds … several minutes (depends on convergence) |
-| Plate-solve refinement | ~1–3 s |
-| **Median total** | **~2 min** |
-
-The implementation now uses binary pair-angle lookup, vectorized third-star search,
-and a 12° FOV-cone cull during verification. RANSAC sampling remains the dominant
-and most variable CPU cost.
-
-## Pipeline architecture
-
-```
-PNG (2136 × 2078)
-   │
-   ▼  STAGE 1 — Deep-learning star detection
-U-Net / HRNet on 16 non-overlapping 512 × 512 tiles
-   │  ~450 – 480 sub-pixel centroids + flux per centroid
-   ▼  STAGE 2 — Body vectors
-SIP-polynomial-corrected gnomonic projection (astropy.wcs.sip_pix2foc)
-   │  body unit vectors in camera-fixed frame, attitude-independent
-   │  top-60 brightest passed to triangle search
-   ▼  STAGE 3 — RANSAC triangle star ID (Wahba SVD #1)
-Random pair → Hipparcos pair-DB lookup (5.3 M pairs, binary search)
-   → random 3rd detection → matching 3rd catalog star
-   → chirality filter rejects mirror triplets
-   → Wahba SVD on 3 pairs → candidate R
-   → verify against all detections at 200″ tolerance
-   │  ≤ 1500 iterations, keep best by verified count
-   ▼  STAGE 4 — Iterative WCS refinement (Wahba SVD #2 via plate-solve)
-For tol in (30 px, 5 px, 1.5 px):
-    build WCS from current pose
-    → project full mag<7.5 catalog
-    → snap detections to nearest projection
-    → scipy.optimize.least_squares over (RA, Dec, roll)
-   ▼  STAGE 5 — Quality gate
-Reject if median Euclidean per-star residual > 2 px or fewer than 8 matches survive
-   │
-   ▼
-Attitude quaternion + (RA, Dec, roll)
-```
-
-## Models trained
-
-| Model | Architecture | Params | Loss | Notes |
-|---|---|---:|---|---|
-| **U-Net** | 4-level encoder-decoder, skip connections | 7,762,465 | Weighted MSE (star × 20) | Run 3, best F1 = 0.636 at threshold 0.55 |
-| **HRNet** | Multi-resolution parallel branches | 3,987,393 | Identical hyperparameters | Run 1 |
-
-Training conditions held identical between the two models:
-
-- 50 epochs, Adam @ lr = 1 e-3 + cosine annealing → 1 e-6
+- 50 epochs, Adam (lr 1e-3) with cosine annealing
 - Heatmap target: Gaussian σ = 1.5 px, peak normalised to 1.0
-- Split 70 / 15 / 15 by image (560 / 120 / 120), seed = 42 (no tile-level leakage)
-- Augmentation: random fliplr + flipud + rot90 (train only)
-- Best checkpoint selected by validation F1 (not by loss — loss is a poor proxy for
-  detection quality on highly sparse targets)
+- Weighted MSE loss: star pixels × 20, background × 1
+- Split 70 / 15 / 15 by image (560 / 120 / 120), seed 42, so no tile-level leakage
+- 8,960 training tiles of 512×512; augmentation with flips and 90° rotations
+- Best checkpoint selected by validation F1, not by loss (loss is a poor proxy on
+  sparse targets)

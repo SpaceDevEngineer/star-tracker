@@ -193,6 +193,11 @@ def main():
 
         if args.summary_only:
             continue
+        if "det_xy" not in art:
+            # Hard-failed frames (e.g. label_missing_wcs) carry no detections —
+            # nothing to draw, but keep them in `artefacts` for the summary.
+            print(f"  skip {art_path.stem}: no det_xy (failed: {art.get('reason', '?')})")
+            continue
 
         stem = art_path.stem
         img_path = data_dir / "images" / f"{stem}.png"

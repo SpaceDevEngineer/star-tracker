@@ -1,0 +1,59 @@
+{
+  "evaluation": "lost-in-space TESS attitude, holdout set, final pipeline (first attempt + refusal-retry)",
+  "attitude_error": "angle of R_gt^T R_pred (body-to-ICRS); cross-boresight = |(y, z)| and roll = |x| of its rotation vector",
+  "false_lock_definition": "wrong star identification: cross-boresight error > 60 arcsec",
+  "counts": {
+    "total_frames": 128,
+    "data_excluded": 0,
+    "solved_frames": 128,
+    "algorithm_refusals": 0,
+    "false_locks": 0,
+    "solved_first_attempt": 124,
+    "recovered_by_retry": 4
+  },
+  "solve_rate_percent": 100.0,
+  "solve_rate_wilson95_percent": [
+    97.08620041018919,
+    99.99999999999999
+  ],
+  "attitude_error_arcsec": {
+    "median": 7.3340499999999995,
+    "mean": 8.6864171875,
+    "p90": 15.016089999999998,
+    "p95": 18.044649999999997,
+    "min": 1.6226,
+    "max": 25.3496
+  },
+  "attitude_error_px_median": 0.356541079241614,
+  "axis_error_arcsec": {
+    "cross_boresight_median": 2.6143,
+    "cross_boresight_p90": 4.7763599999999995,
+    "roll_median": 6.499,
+    "roll_p90": 14.705279999999998
+  },
+  "threshold_counts": {
+    "subpixel_below_20_57_arcsec": 125,
+    "below_60_arcsec": 128
+  },
+  "first_attempt_attitude_error_arcsec": {
+    "median": 7.334011367402498,
+    "mean": 8.688887945135754,
+    "p90": 14.962673196387255,
+    "p95": 18.0716472430415,
+    "min": 1.6225833198692245,
+    "max": 25.34958440239287
+  },
+  "frame_time_gpu_s": {
+    "median": 10.5635,
+    "mean": 19.1085625,
+    "p90": 40.694399999999995,
+    "p95": 65.22594999999997,
+    "min": 1.042,
+    "max": 203.845
+  },
+  "provenance": {
+    "source_artifacts": "128 per-frame JSON files from the thesis evaluation run",
+    "check": "errors equal the rigid rotation between predicted and reference WCS sky grids (tests/test_core_geometry.py)",
+    "generated": "2026-10-20"
+  }
+}
